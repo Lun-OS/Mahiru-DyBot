@@ -4,6 +4,7 @@ import api from '@/services/api';
 interface AuthState {
   isAuthenticated: boolean;
   isLoading: boolean;
+  initialized: boolean;
   error: string | null;
   login: (password: string) => Promise<void>;
   setup: (password: string) => Promise<void>;
@@ -15,6 +16,7 @@ interface AuthState {
 export const useAuthStore = create<AuthState>((set) => ({
   isAuthenticated: false,
   isLoading: true,
+  initialized: false,
   error: null,
 
   login: async (password: string) => {
@@ -32,7 +34,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       set({ isLoading: true, error: null });
       await api.setup({ password });
-      set({ isAuthenticated: true, isLoading: false });
+      set({ isAuthenticated: true, initialized: true, isLoading: false });
     } catch (error) {
       set({ error: (error as Error).message, isLoading: false });
       throw error;
@@ -55,19 +57,18 @@ export const useAuthStore = create<AuthState>((set) => ({
       const status = await api.checkInit();
       
       if (!status.initialized) {
-        // Need to setup
-        set({ isAuthenticated: false, isLoading: false });
+        set({ isAuthenticated: false, initialized: false, isLoading: false });
         return;
       }
 
       if (api.getToken()) {
         const isValid = await api.verifyToken();
-        set({ isAuthenticated: isValid, isLoading: false });
+        set({ isAuthenticated: isValid, initialized: true, isLoading: false });
       } else {
-        set({ isAuthenticated: false, isLoading: false });
+        set({ isAuthenticated: false, initialized: true, isLoading: false });
       }
     } catch (error) {
-      set({ isAuthenticated: false, isLoading: false });
+      set({ isAuthenticated: false, initialized: false, isLoading: false });
     }
   },
 

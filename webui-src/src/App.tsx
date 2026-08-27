@@ -12,7 +12,7 @@ import { Loader2 } from 'lucide-react';
 import { createContext, useContext } from 'react';
 
 function AuthGate({ children, requireAuth }: { children: React.ReactNode; requireAuth: boolean }) {
-  const { isAuthenticated, isLoading } = useAuthStore();
+  const { isAuthenticated, isLoading, initialized } = useAuthStore();
 
   if (isLoading) {
     return (
@@ -20,6 +20,10 @@ function AuthGate({ children, requireAuth }: { children: React.ReactNode; requir
         <Loader2 className="w-8 h-8 text-blue-400 animate-spin" />
       </div>
     );
+  }
+
+  if (!initialized) {
+    return <Redirect to="/setup" />;
   }
 
   if (requireAuth && !isAuthenticated) {

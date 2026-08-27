@@ -1,9 +1,6 @@
 import { useState } from 'react';
 import { useRouter } from '@/lib/router';
 import { useAuthStore } from '@/stores/authStore';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Eye, EyeOff, Loader2 } from 'lucide-react';
 
 export function Setup() {
@@ -16,14 +13,8 @@ export function Setup() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!password || !confirmPassword) return;
-
-    if (password !== confirmPassword) {
-      return;
-    }
-
-    if (password.length < 6) {
-      return;
-    }
+    if (password !== confirmPassword) return;
+    if (password.length < 6) return;
 
     try {
       await setup(password);
@@ -36,99 +27,86 @@ export function Setup() {
   const isValid = password.length >= 6 && password === confirmPassword;
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      {/* Star field background */}
-      <div className="star-field">
-        {Array.from({ length: 50 }).map((_, i) => (
-          <div
-            key={i}
-            className="star"
-            style={{
-              left: `${Math.random() * 100}%`,
-              top: `${Math.random() * 100}%`,
-              width: `${Math.random() * 2 + 1}px`,
-              height: `${Math.random() * 2 + 1}px`,
-              animationDuration: `${Math.random() * 3 + 2}s`,
-              animationDelay: `${Math.random() * 2}s`,
-            }}
-          />
-        ))}
-      </div>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem', background: 'linear-gradient(ellipse at bottom, #1b2735 0%, #090a0f 100%)' }}>
+      <div style={{
+        width: '100%', maxWidth: '28rem', padding: '2rem',
+        background: 'rgba(255,255,255,0.06)', borderRadius: '1rem',
+        border: '1px solid rgba(255,255,255,0.1)', backdropFilter: 'blur(20px)',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.4)'
+      }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1.5rem' }}>
+          <img src="/webui/logo.jpg" alt="Logo" style={{ width: '4rem', height: '4rem', borderRadius: '1rem', objectFit: 'cover' }} />
 
-      <Card className="w-full max-w-md glass-card">
-        <CardHeader className="space-y-1 text-center">
-          <div className="flex justify-center mb-4">
-            <img src="/webui/logo.jpg" alt="Logo" className="w-16 h-16 rounded-2xl object-cover" />
+          <div style={{ textAlign: 'center' }}>
+            <h1 style={{ fontSize: '1.5rem', fontWeight: 700, color: '#fff', margin: '0 0 0.5rem' }}>初始化设置</h1>
+            <p style={{ fontSize: '0.875rem', color: 'rgba(255,255,255,0.5)', margin: 0 }}>
+              首次使用需设置管理密码，用于登录 WebUI 管理面板
+            </p>
           </div>
-          <CardTitle className="text-2xl font-bold text-white">初始化设置</CardTitle>
-          <CardDescription className="text-gray-400">
-            首次使用请设置管理密码
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="relative">
-              <Input
+
+          <form onSubmit={handleSubmit} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            <div style={{ position: 'relative' }}>
+              <input
                 type={showPassword ? 'text' : 'password'}
                 placeholder="设置密码（至少 6 位）"
                 value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  clearError();
-                }}
-                className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 pr-10"
+                onChange={(e) => { setPassword(e.target.value); clearError(); }}
                 disabled={isLoading}
+                style={{
+                  width: '100%', padding: '0.625rem 2.5rem 0.625rem 0.75rem',
+                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: '0.5rem', color: '#fff', fontSize: '0.875rem', outline: 'none'
+                }}
               />
               <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                type="button" onClick={() => setShowPassword(!showPassword)}
+                style={{ position: 'absolute', right: '0.75rem', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)', padding: 0 }}
               >
-                {showPassword ? (
-                  <EyeOff className="w-5 h-5" />
-                ) : (
-                  <Eye className="w-5 h-5" />
-                )}
+                {showPassword ? <EyeOff style={{ width: '1.25rem', height: '1.25rem' }} /> : <Eye style={{ width: '1.25rem', height: '1.25rem' }} />}
               </button>
             </div>
 
-            <Input
+            <input
               type={showPassword ? 'text' : 'password'}
               placeholder="确认密码"
               value={confirmPassword}
-              onChange={(e) => {
-                setConfirmPassword(e.target.value);
-                clearError();
-              }}
-              className="bg-white/5 border-white/10 text-white placeholder:text-gray-500"
+              onChange={(e) => { setConfirmPassword(e.target.value); clearError(); }}
               disabled={isLoading}
+              style={{
+                width: '100%', padding: '0.625rem 0.75rem',
+                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: '0.5rem', color: '#fff', fontSize: '0.875rem', outline: 'none'
+              }}
             />
 
             {password && confirmPassword && password !== confirmPassword && (
-              <p className="text-sm text-red-400 text-center">两次输入的密码不一致</p>
+              <p style={{ fontSize: '0.875rem', color: '#f87171', textAlign: 'center', margin: 0 }}>两次输入的密码不一致</p>
             )}
 
             {password && password.length < 6 && (
-              <p className="text-sm text-yellow-400 text-center">密码长度至少 6 位</p>
+              <p style={{ fontSize: '0.875rem', color: '#facc15', textAlign: 'center', margin: 0 }}>密码长度至少 6 位</p>
             )}
 
             {error && (
-              <p className="text-sm text-red-400 text-center">{error}</p>
+              <p style={{ fontSize: '0.875rem', color: '#f87171', textAlign: 'center', margin: 0 }}>{error}</p>
             )}
 
-            <Button
+            <button
               type="submit"
-              className="w-full bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700"
               disabled={isLoading || !isValid}
+              style={{
+                width: '100%', padding: '0.625rem', border: 'none', borderRadius: '0.5rem',
+                background: '#165DFF', color: '#fff',
+                fontSize: '0.875rem', fontWeight: 500, cursor: isValid ? 'pointer' : 'not-allowed',
+                opacity: isValid ? 1 : 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem'
+              }}
             >
-              {isLoading ? (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              ) : null}
+              {isLoading && <Loader2 style={{ width: '1rem', height: '1rem', animation: 'spin 1s linear infinite' }} />}
               确认设置
-            </Button>
+            </button>
           </form>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }
