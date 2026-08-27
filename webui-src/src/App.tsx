@@ -13,6 +13,7 @@ import { createContext, useContext } from 'react';
 
 function AuthGate({ children, requireAuth }: { children: React.ReactNode; requireAuth: boolean }) {
   const { isAuthenticated, isLoading, initialized } = useAuthStore();
+  const { path } = useRouter();
 
   if (isLoading) {
     return (
@@ -22,7 +23,7 @@ function AuthGate({ children, requireAuth }: { children: React.ReactNode; requir
     );
   }
 
-  if (!initialized) {
+  if (!initialized && path !== '/setup') {
     return <Redirect to="/setup" />;
   }
 
@@ -30,7 +31,7 @@ function AuthGate({ children, requireAuth }: { children: React.ReactNode; requir
     return <Redirect to="/login" />;
   }
 
-  if (!requireAuth && isAuthenticated) {
+  if (!requireAuth && isAuthenticated && path !== '/setup') {
     return <Redirect to="/" />;
   }
 
