@@ -1,0 +1,11 @@
+{
+  "listen_addr": ":17836",
+  "udp_addr": ":17837",
+  "access_token": "",
+  "headless": true,
+  "cdp_url": "",
+  "browser_channel": "",
+  "storage_dir": "./storage",
+  "ws_path": "/event",
+  "user_agent": ""
+}
