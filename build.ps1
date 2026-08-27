@@ -1,31 +1,56 @@
 # Mahiru DyBot build script
-# Builds Windows amd64, Linux amd64, Linux arm (armv7)
-# Always builds frontend first
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-Write-Host "==> Building frontend (webui-src -> webui)" -ForegroundColor Cyan
+# ---- Build frontend ----
+Write-Host "==> Building frontend" -ForegroundColor Cyan
 Push-Location webui-src
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "Frontend build failed" }
 Pop-Location
 
-Write-Host "==> Building Windows amd64" -ForegroundColor Cyan
-$env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:CGO_ENABLED = "0"
-go build -trimpath -ldflags "-s -w" -o dist/windows-amd64/mahiru-dybot.exe .
-if ($LASTEXITCODE -ne 0) { throw "windows build failed" }
+# ---- Locate frontend output ----
+$frontendOut = $null
+if (Test-Path "webui-src/build") { $frontendOut = "webui-src/build" }
+elseif (Test-Path "webui-src/dist") { $frontendOut = "webui-src/dist" }
+if (-not $frontendOut) {
+    Write-Host "Warning: Frontend build output not found." -ForegroundColor Yellow
+}
 
-Write-Host "==> Building Linux amd64" -ForegroundColor Cyan
-$env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:CGO_ENABLED = "0"
-go build -trimpath -ldflags "-s -w" -o dist/linux-amd64/mahiru-dybot .
-if ($LASTEXITCODE -ne 0) { throw "linux amd64 build failed" }
+# ---- Copy to root webui/ for embedding ----
+if ($frontendOut) {
+    if (Test-Path "webui") { Remove-Item -Recurse -Force "webui" }
+    Copy-Item -Recurse $frontendOut "webui"
+}
 
-Write-Host "==> Building Linux arm (armv7)" -ForegroundColor Cyan
-$env:GOOS = "linux"; $env:GOARCH = "arm"; $env:GOARM = "7"; $env:CGO_ENABLED = "0"
-go build -trimpath -ldflags "-s -w" -o dist/linux-arm/mahiru-dybot .
-if ($LASTEXITCODE -ne 0) { throw "linux arm build failed" }
+# ---- Platforms ----
+$platforms = @(
+    @{ GOOS="windows"; GOARCH="amd64"; GOARM=""; OUT="dist/windows-amd64"; BIN="mahiru-dybot.exe" },
+    @{ GOOS="linux";   GOARCH="amd64"; GOARM=""; OUT="dist/linux-amd64";   BIN="mahiru-dybot"    },
+    @{ GOOS="linux";   GOARCH="arm";   GOARM="7"; OUT="dist/linux-arm";     BIN="mahiru-dybot"    }
+)
+
+# ---- Build each platform ----
+foreach ($p in $platforms) {
+    Write-Host "==> Building $($p.GOOS) $($p.GOARCH)" -ForegroundColor Cyan
+    $env:GOOS = $p.GOOS; $env:GOARCH = $p.GOARCH; $env:CGO_ENABLED = "0"
+    if ($p.GOARM) { $env:GOARM = $p.GOARM } else { Remove-Item Env:GOARM -ErrorAction SilentlyContinue }
+    
+    $outDir = $p.OUT
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    $binPath = Join-Path $outDir $p.BIN
+    go build -trimpath -ldflags "-s -w" -o $binPath .
+    if ($LASTEXITCODE -ne 0) { throw "$($p.GOOS) $($p.GOARCH) build failed" }
+
+    # ---- Copy frontend to each platform's folder ----
+    if ($frontendOut) {
+        $destWebui = Join-Path $outDir "webui"
+        if (Test-Path $destWebui) { Remove-Item -Recurse -Force $destWebui }
+        Copy-Item -Recurse $frontendOut $destWebui
+        Write-Host "   -> Copied webui to $destWebui" -ForegroundColor DarkGray
+    }
+}
 
 Remove-Item Env:GOOS, Env:GOARCH, Env:GOARM, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 
-Write-Host "==> Build complete. Binaries in dist/:" -ForegroundColor Green
-Get-ChildItem -Path dist -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+Write-Host "==> Done. Each platform folder contains binary + webui/" -ForegroundColor Green
