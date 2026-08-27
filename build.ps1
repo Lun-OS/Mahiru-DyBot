@@ -9,18 +9,10 @@ npm run build
 if ($LASTEXITCODE -ne 0) { throw "Frontend build failed" }
 Pop-Location
 
-# ---- Locate frontend output ----
-$frontendOut = $null
-if (Test-Path "webui-src/build") { $frontendOut = "webui-src/build" }
-elseif (Test-Path "webui-src/dist") { $frontendOut = "webui-src/dist" }
-if (-not $frontendOut) {
-    Write-Host "Warning: Frontend build output not found." -ForegroundColor Yellow
-}
-
-# ---- Copy to root webui/ for embedding ----
-if ($frontendOut) {
-    if (Test-Path "webui") { Remove-Item -Recurse -Force "webui" }
-    Copy-Item -Recurse $frontendOut "webui"
+# ---- 前端产物已经输出到项目根目录的 webui/ ----
+$frontendSource = Join-Path $PSScriptRoot "webui"
+if (-not (Test-Path $frontendSource)) {
+    Write-Host "Warning: webui/ not found after build, skipping copy" -ForegroundColor Yellow
 }
 
 # ---- Platforms ----
@@ -42,11 +34,11 @@ foreach ($p in $platforms) {
     go build -trimpath -ldflags "-s -w" -o $binPath .
     if ($LASTEXITCODE -ne 0) { throw "$($p.GOOS) $($p.GOARCH) build failed" }
 
-    # ---- Copy frontend to each platform's folder ----
-    if ($frontendOut) {
+    # ---- Copy webui/ from root to this platform folder ----
+    if (Test-Path $frontendSource) {
         $destWebui = Join-Path $outDir "webui"
         if (Test-Path $destWebui) { Remove-Item -Recurse -Force $destWebui }
-        Copy-Item -Recurse $frontendOut $destWebui
+        Copy-Item -Recurse $frontendSource $destWebui
         Write-Host "   -> Copied webui to $destWebui" -ForegroundColor DarkGray
     }
 }
