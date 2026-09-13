@@ -120,13 +120,18 @@ function UsageRing({ percent, label }: { percent: number; label: string }) {
 export function Dashboard() {
   const { accounts, fetchAccounts } = useAccountStore();
   const [sysInfo, setSysInfo] = useState<SystemResponse | null>(null);
+  const [version, setVersion] = useState<string>('');
   const [isLoading, setIsLoading] = useState(true);
 
   const loadSystemInfo = async () => {
     try {
       await fetchAccounts();
-      const info = await api.get<SystemResponse>('/system/info');
+      const [info, ver] = await Promise.all([
+        api.get<SystemResponse>('/system/info'),
+        api.getVersion(),
+      ]);
       setSysInfo(info);
+      setVersion(ver);
     } catch (error) {
       console.error('Failed to load system info:', error);
     } finally {
@@ -177,7 +182,7 @@ export function Dashboard() {
             </div>
             <div className="flex justify-between">
               <span className="text-gray-400 text-sm">软件版本</span>
-              <span className="text-white text-sm">v3.0.0</span>
+              <span className="text-white text-sm">v{version || '1.0.0'}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-gray-400 text-sm">运行时间</span>

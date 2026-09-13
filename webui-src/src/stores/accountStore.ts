@@ -84,30 +84,48 @@ export const useAccountStore = create<AccountStoreState>((set) => ({
   startAccount: async (id: string) => {
     try {
       set({ error: null });
-      await api.startAccount(id);
+      // 立即更新 UI 为 "启动中"
       set((state) => ({
         accounts: state.accounts.map((a) =>
           a.id === id ? { ...a, state: 'starting' as AccountStateType } : a
         ),
       }));
+      // 后台启动浏览器（阻塞15-30秒）
+      await api.startAccount(id);
+      // 启动完成后刷新真实状态
+      const accounts = await api.getAccounts();
+      set({ accounts });
     } catch (error) {
-      set({ error: (error as Error).message });
-      throw error;
+      // 启动失败，刷新状态
+      try {
+        const accounts = await api.getAccounts();
+        set({ accounts });
+      } catch {
+        set({ error: (error as Error).message });
+      }
     }
   },
 
   stopAccount: async (id: string) => {
     try {
       set({ error: null });
-      await api.stopAccount(id);
+      // 立即更新 UI 为 "停止中"
       set((state) => ({
         accounts: state.accounts.map((a) =>
           a.id === id ? { ...a, state: 'stopped' as AccountStateType } : a
         ),
       }));
+      await api.stopAccount(id);
+      // 停止完成后刷新真实状态
+      const accounts = await api.getAccounts();
+      set({ accounts });
     } catch (error) {
-      set({ error: (error as Error).message });
-      throw error;
+      try {
+        const accounts = await api.getAccounts();
+        set({ accounts });
+      } catch {
+        set({ error: (error as Error).message });
+      }
     }
   },
 

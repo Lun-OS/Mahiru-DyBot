@@ -46,7 +46,39 @@ func actGetUserInfo(ctx *ActionContext) *ActionResult {
 	if err != nil {
 		return failResult(RetCodeInternalErr, err.Error(), ctx.Echo)
 	}
-	return okResult(user, ctx.Echo)
+	// 转换为 OneBot 标准格式 + 扩展字段
+	sex := "unknown"
+	switch user.Sex {
+	case 1:
+		sex = "male"
+	case 2:
+		sex = "female"
+	}
+	return okResult(map[string]interface{}{
+		"user_id":                 user.UserID,
+		"nickname":                user.Nickname,
+		"sex":                     sex,
+		"age":                     user.Age,
+		"avatar":                  user.AvatarThumb,
+		"qid":                     user.Qid,
+		"long_nick":               user.Signature,
+		"registertime":            0,
+		"level":                   0,
+		"sex_id":                  user.Sex,
+		"sec_uid":                 user.SecUID,
+		"short_id":                user.ShortID,
+		"signature":               user.Signature,
+		"avatar_thumb":            user.AvatarThumb,
+		"avatar_small":            user.AvatarSmall,
+		"follow_status":           user.FollowStatus,
+		"follower_status":         user.FollowerStatus,
+		"verification_type":       user.VerificationType,
+		"custom_verify":           user.CustomVerify,
+		"enterprise_verify_reason": user.EnterpriseVerifyReason,
+		"total_favorited":         user.TotalFavorited,
+		"favoriting_count":        user.FavoritingCount,
+		"friendship_status":       user.FriendshipStatus,
+	}, ctx.Echo)
 }
 
 func actGetStrangers(ctx *ActionContext) *ActionResult {

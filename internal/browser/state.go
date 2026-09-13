@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/playwright-community/playwright-go"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // modMeta IM SDK webpack 模块 ID 持久化。
@@ -75,81 +75,143 @@ func randomChromeUA() string {
 // 使用原子写入：先写临时文件再 rename，防止写一半崩溃导致状态损坏。
 func (in *Instance) SaveState() error {
 	in.mu.Lock()
-	defer in.mu.Unlock()
-	if in.context == nil {
-		return fmt.Errorf("context 未初始化")
+	page := in.page
+	in.mu.Unlock()
+	if page == nil {
+		return fmt.Errorf("page 未初始化")
 	}
 	_ = os.MkdirAll(in.StorageDir, 0o755)
 	path := filepath.Join(in.StorageDir, "state.json")
 	tmpPath := path + ".tmp"
 
-	// 1. 保存 cookies + localStorage（Playwright StorageState）到临时文件
-	_, err := in.context.StorageState(playwright.BrowserContextStorageStateOptions{Path: playwright.String(tmpPath)})
+	// 1. 通过 CDP 获取 cookies
+	cookies, err := proto.NetworkGetCookies{}.Call(page)
+	if err != nil {
+		cookies = &proto.NetworkGetCookiesResult{}
+	}
+
+	// 2. 通过 JS 获取 localStorage
+	lsData := in.collectLocalStorage()
+
+	// 3. 组装 state 结构
+	state := make(map[string]interface{})
+	cookieList := make([]map[string]interface{}, 0)
+	if cookies != nil {
+		for _, c := range cookies.Cookies {
+			cookieList = append(cookieList, map[string]interface{}{
+				"name":     c.Name,
+				"value":    c.Value,
+				"domain":   c.Domain,
+				"path":     c.Path,
+				"expires":  c.Expires,
+				"httpOnly": c.HTTPOnly,
+				"secure":   c.Secure,
+				"sameSite": string(c.SameSite),
+			})
+		}
+	}
+	state["cookies"] = cookieList
+
+	lsMap := make(map[string]interface{})
+	for origin, items := range lsData {
+		lsArr := make([]map[string]string, 0, len(items))
+		for _, item := range items {
+			lsArr = append(lsArr, map[string]string{"name": item.Name, "value": item.Value})
+		}
+		lsMap[origin] = lsArr
+	}
+	state["origins"] = lsMap
+
+	// 4. 写入临时文件
+	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
+	if err := os.WriteFile(tmpPath, raw, 0o644); err != nil {
+		return err
+	}
 
-	// 2. 追加 sessionStorage（Playwright 不支持，通过 page JS 采集）
-	if in.page != nil {
+	// 5. 追加 sessionStorage
+	if page != nil {
 		ssData := in.collectSessionStorage()
 		if len(ssData) > 0 {
 			_ = in.mergeSessionStorage(tmpPath, ssData)
 		}
 	}
 
-	// 3. 原子替换：rename 临时文件到正式路径
+	// 6. 原子替换
 	if err := os.Rename(tmpPath, path); err != nil {
-		// rename 失败时回退到直接写入（跨文件系统场景）
-		// 重新调用 StorageState 直接写入正式路径
-		_, err2 := in.context.StorageState(playwright.BrowserContextStorageStateOptions{Path: playwright.String(path)})
-		if err2 != nil {
-			// 最后手段：读取 tmp 写入正式路径
-			data, readErr := os.ReadFile(tmpPath)
-			if readErr == nil {
-				_ = os.WriteFile(path, data, 0o644)
-			}
-		}
+		_ = os.WriteFile(path, raw, 0o644)
 		_ = os.Remove(tmpPath)
 	}
 	return nil
 }
 
-// collectSessionStorage 从当前页面收集 sessionStorage。
-func (in *Instance) collectSessionStorage() map[string][]sessionStorageItem {
+// collectLocalStorage 从当前页面收集 localStorage。
+func (in *Instance) collectLocalStorage() map[string][]sessionStorageItem {
 	result := make(map[string][]sessionStorageItem)
-	res, err := in.page.Evaluate(`(() => {
+	res := in.page.MustEval(`() => {
 		var out = {};
-		for (var i = 0; i < sessionStorage.length; i++) {
-			var key = sessionStorage.key(i);
-			out[key] = sessionStorage.getItem(key);
+		for (var i = 0; i < localStorage.length; i++) {
+			var key = localStorage.key(i);
+			out[key] = localStorage.getItem(key);
 		}
 		return JSON.stringify(out);
-	})()`)
-	if err != nil {
-		return nil
-	}
+	}`)
 	var raw map[string]string
 	var ss string
-	switch v := res.(type) {
-	case string:
-		ss = v
-	default:
-		b, _ := json.Marshal(res)
+	if str := res.Str(); str != "" {
+		ss = str
+	} else {
+		b, _ := json.Marshal(res.Val())
 		ss = string(b)
 	}
 	if json.Unmarshal([]byte(ss), &raw) != nil {
 		return nil
 	}
-	origin, _ := in.page.Evaluate("location.origin")
-	originStr, _ := origin.(string)
-	if originStr == "" {
+	origin := in.page.MustEval(`() => location.origin`).Str()
+	if origin == "" {
 		return nil
 	}
 	items := make([]sessionStorageItem, 0, len(raw))
 	for k, v := range raw {
 		items = append(items, sessionStorageItem{Name: k, Value: v})
 	}
-	result[originStr] = items
+	result[origin] = items
+	return result
+}
+
+// collectSessionStorage 从当前页面收集 sessionStorage。
+func (in *Instance) collectSessionStorage() map[string][]sessionStorageItem {
+	result := make(map[string][]sessionStorageItem)
+	res := in.page.MustEval(`() => {
+		var out = {};
+		for (var i = 0; i < sessionStorage.length; i++) {
+			var key = sessionStorage.key(i);
+			out[key] = sessionStorage.getItem(key);
+		}
+		return JSON.stringify(out);
+	}`)
+	var raw map[string]string
+	var ss string
+	if str := res.Str(); str != "" {
+		ss = str
+	} else {
+		b, _ := json.Marshal(res.Val())
+		ss = string(b)
+	}
+	if json.Unmarshal([]byte(ss), &raw) != nil {
+		return nil
+	}
+	origin := in.page.MustEval(`() => location.origin`).Str()
+	if origin == "" {
+		return nil
+	}
+	items := make([]sessionStorageItem, 0, len(raw))
+	for k, v := range raw {
+		items = append(items, sessionStorageItem{Name: k, Value: v})
+	}
+	result[origin] = items
 	return result
 }
 
@@ -181,24 +243,6 @@ func (in *Instance) mergeSessionStorage(path string, ssData map[string][]session
 	return os.WriteFile(path, out, 0o644)
 }
 
-// cookieToOptional playwright.Cookie -> OptionalCookie 转换。
-func cookieToOptional(c playwright.Cookie) playwright.OptionalCookie {
-	oc := playwright.OptionalCookie{
-		Name:     c.Name,
-		Value:    c.Value,
-		Domain:   playwright.String(c.Domain),
-		Path:     playwright.String(c.Path),
-		Expires:  playwright.Float(c.Expires),
-		HttpOnly: playwright.Bool(c.HttpOnly),
-		Secure:   playwright.Bool(c.Secure),
-	}
-	if c.SameSite != nil {
-		ss := *c.SameSite
-		oc.SameSite = &ss
-	}
-	return oc
-}
-
 // HasSavedState 实例目录是否存在可恢复的登录态。
 // 检查 state.json 存在且包含 sessionid cookie。
 func (in *Instance) HasSavedState() bool {
@@ -207,7 +251,6 @@ func (in *Instance) HasSavedState() bool {
 	if err != nil || len(data) < 10 {
 		return false
 	}
-	// 验证文件内容是否包含有效 cookie
 	var state struct {
 		Cookies []struct {
 			Name string `json:"name"`

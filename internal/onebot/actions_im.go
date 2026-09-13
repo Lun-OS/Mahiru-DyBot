@@ -48,10 +48,13 @@ func actSendPrivateMsg(ctx *ActionContext) *ActionResult {
 	if err := ctx.Bind(&req); err != nil {
 		return failResult(RetCodeBadRequest, "参数解析失败: "+err.Error(), ctx.Echo)
 	}
-	text := extractText(req.Message)
-	if text == "" {
+	
+	// 解析消息类型和内容
+	msgType, content := extractMessageType(req.Message)
+	if content == "" {
 		return failResult(RetCodeBadRequest, "message 为空", ctx.Echo)
 	}
+	
 	inst, res := ctx.Server.accountInst(ctx)
 	if res != nil {
 		return res
@@ -60,7 +63,21 @@ func actSendPrivateMsg(ctx *ActionContext) *ActionResult {
 	if uidStr == "" {
 		return failResult(RetCodeBadRequest, "user_id 无法解析为有效 uid", ctx.Echo)
 	}
-	r, err := inst.SendMessage(uidStr, text, 25*time.Second)
+	
+	var r *browser.SendResult
+	var err error
+	
+	// 根据消息类型选择发送方式
+	switch msgType {
+	case "text":
+		r, err = inst.SendMessage(uidStr, content, 25*time.Second)
+	case "image", "sticker":
+		r, err = inst.SendMessageWithType(uidStr, msgType, content, 25*time.Second)
+	default:
+		// 默认作为文本发送
+		r, err = inst.SendMessage(uidStr, content, 25*time.Second)
+	}
+	
 	if err != nil {
 		return failResult(RetCodeInternalErr, err.Error(), ctx.Echo)
 	}
@@ -73,7 +90,7 @@ func actSendPrivateMsg(ctx *ActionContext) *ActionResult {
 		}
 		return failResult(RetCodeInternalErr, "发送失败: "+errMsg, ctx.Echo)
 	}
-	ctx.Server.rememberPrivateConv(inst.ID, r.ConversationShortID, uidStr)
+	ctx.Server.rememberPrivateConv(inst.SelfUID(), r.ConversationShortID, uidStr)
 	result := map[string]interface{}{
 		"message_id":      r.ClientID,
 		"server_id":       r.ServerID,
@@ -99,15 +116,32 @@ func actSendGroupMsg(ctx *ActionContext) *ActionResult {
 	if !ok || gid == 0 {
 		return failResult(RetCodeBadRequest, "group_id 缺失或非法", ctx.Echo)
 	}
-	text := extractText(req.Message)
-	if text == "" {
+	
+	// 解析消息类型和内容
+	msgType, content := extractMessageType(req.Message)
+	if content == "" {
 		return failResult(RetCodeBadRequest, "message 为空", ctx.Echo)
 	}
+	
 	inst, res := ctx.Server.accountInst(ctx)
 	if res != nil {
 		return res
 	}
-	r, err := inst.SendGroupMessage(strconv.FormatInt(gid, 10), text, 25*time.Second)
+	
+	var r *browser.SendResult
+	var err error
+	
+	// 根据消息类型选择发送方式
+	switch msgType {
+	case "text":
+		r, err = inst.SendGroupMessage(strconv.FormatInt(gid, 10), content, 25*time.Second)
+	case "image", "sticker":
+		r, err = inst.SendGroupMessageWithType(strconv.FormatInt(gid, 10), msgType, content, 25*time.Second)
+	default:
+		// 默认作为文本发送
+		r, err = inst.SendGroupMessage(strconv.FormatInt(gid, 10), content, 25*time.Second)
+	}
+	
 	if err != nil {
 		return failResult(RetCodeInternalErr, err.Error(), ctx.Echo)
 	}
@@ -207,25 +241,40 @@ func actGetHistoryMsg(ctx *ActionContext) *ActionResult {
 		} else {
 			nickname = inst.GetUserNickname(it.Sender)
 		}
+		if nickname == "" {
+			nickname = strconv.FormatInt(senderUID, 10)
+		}
 		postType := "message"
 		if isFromMe {
 			postType = "message_sent"
 		}
-		msgs = append(msgs, map[string]interface{}{
+		seq := i + 1
+		sender := EventSender{
+			UserID:   senderUID,
+			Nickname: nickname,
+			Card:     "",
+		}
+		msg := map[string]interface{}{
 			"self_id":        selfUID,
-			"user_id":        uid,
+			"user_id":        senderUID,
 			"time":           it.CreatedAt,
 			"message_id":     msgID,
-			"message_seq":    i + 1,
+			"real_id":        msgID,
+			"message_seq":    seq,
+			"real_seq":       strconv.Itoa(seq),
 			"message_type":   "private",
-			"sender":         map[string]interface{}{"user_id": senderUID, "nickname": nickname},
+			"sender":         sender,
 			"raw_message":    textContent,
 			"font":           14,
 			"sub_type":       "friend",
 			"message":        []interface{}{map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": textContent}}},
 			"message_format": "array",
 			"post_type":      postType,
-		})
+		}
+		if isFromMe {
+			msg["message_sent_type"] = "self"
+		}
+		msgs = append(msgs, msg)
 	}
 	return okResult(map[string]interface{}{"messages": msgs}, ctx.Echo)
 }
@@ -285,25 +334,42 @@ func actGetGroupHistoryMsg(ctx *ActionContext) *ActionResult {
 		if isFromMe {
 			role = "owner"
 		}
+		if nickname == "" {
+			nickname = strconv.FormatInt(senderUID, 10)
+		}
 		postType := "message"
 		if isFromMe {
 			postType = "message_sent"
 		}
-		msgs = append(msgs, map[string]interface{}{
+		seq := i + 1
+		sender := EventSender{
+			UserID:   senderUID,
+			Nickname: nickname,
+			Card:     "",
+			Role:     role,
+		}
+		msg := map[string]interface{}{
 			"self_id":        selfUID,
+			"user_id":        senderUID,
 			"group_id":       gid,
 			"time":           it.CreatedAt,
 			"message_id":     msgID,
-			"message_seq":    i + 1,
+			"real_id":        msgID,
+			"message_seq":    seq,
+			"real_seq":       strconv.Itoa(seq),
 			"message_type":   "group",
-			"sender":         map[string]interface{}{"user_id": senderUID, "nickname": nickname, "card": "", "role": role},
+			"sender":         sender,
 			"raw_message":    textContent,
 			"font":           14,
 			"sub_type":       "normal",
 			"message":        []interface{}{map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": textContent}}},
 			"message_format": "array",
 			"post_type":      postType,
-		})
+		}
+		if isFromMe {
+			msg["message_sent_type"] = "self"
+		}
+		msgs = append(msgs, msg)
 	}
 	return okResult(map[string]interface{}{"messages": msgs}, ctx.Echo)
 }

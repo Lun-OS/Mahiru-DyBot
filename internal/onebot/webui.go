@@ -54,6 +54,15 @@ func readBody(r *http.Request) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r.Body, 8<<20))
 }
 
+// handleWebUIVersion GET /api/webui/version → 版本信息（无需鉴权）。
+func (s *Server) handleWebUIVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSONRaw(w, map[string]interface{}{
+		"ok":      true,
+		"version": appVersion,
+		"name":    appName,
+	})
+}
+
 // ---------- 认证 ----------
 
 // handleWebUIMe GET /api/webui/me → 初始化状态 + 当前令牌有效性。
@@ -131,6 +140,8 @@ func (s *Server) handleWebUISettingsGET(w http.ResponseWriter, r *http.Request) 
 	resp := map[string]interface{}{
 		"ok":                  true,
 		"onebot_access_token": st.OneBotAccessToken,
+		"token":               st.OneBotAccessToken,
+		"listen_addr":         s.Addr,
 		"screenshot_max_fps":  st.ScreenshotMaxFPS,
 		"jpeg_quality":        st.JpegQuality,
 		"reverse_ws":          st.ReverseWS,
@@ -145,6 +156,7 @@ func (s *Server) handleWebUISettingsPOST(w http.ResponseWriter, r *http.Request)
 	body, _ := readBody(r)
 	var req struct {
 		OneBotAccessToken *string                  `json:"onebot_access_token"`
+		Token             *string                  `json:"token"`
 		ScreenshotMaxFPS  *int                     `json:"screenshot_max_fps"`
 		JpegQuality       *int                     `json:"jpeg_quality"`
 		ReverseWS         []config.ReverseWSConfig `json:"reverse_ws"`
@@ -156,6 +168,8 @@ func (s *Server) handleWebUISettingsPOST(w http.ResponseWriter, r *http.Request)
 	err := s.RT.Update(func(st *config.RuntimeSettings) {
 		if req.OneBotAccessToken != nil {
 			st.OneBotAccessToken = strings.TrimSpace(*req.OneBotAccessToken)
+		} else if req.Token != nil {
+			st.OneBotAccessToken = strings.TrimSpace(*req.Token)
 		}
 		if req.ScreenshotMaxFPS != nil && *req.ScreenshotMaxFPS > 0 {
 			st.ScreenshotMaxFPS = *req.ScreenshotMaxFPS
@@ -227,12 +241,51 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 
 // handleAccountInfo GET /api/webui/accounts/{id}/info。
 func (s *Server) handleAccountInfo(w http.ResponseWriter, r *http.Request) {
-	info, ok := s.BM.Info(r.PathValue("id"))
+	id := r.PathValue("id")
+	info, ok := s.BM.Info(id)
 	if !ok {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": "账号不存在"})
 		return
 	}
-	writeJSONRaw(w, map[string]interface{}{"ok": true, "account": info})
+	// 构建前端期望的格式
+	account := map[string]interface{}{
+		"id":          info.ID,
+		"name":        info.Name,
+		"uid":         info.UID,
+		"nickname":    info.Nickname,
+		"created_at":  info.CreatedAt,
+		"viewport_width":  info.ViewportWidth,
+		"viewport_height": info.ViewportHeight,
+		"custom_ua":   info.CustomUA,
+		"state":       info.State,
+		"error":       info.Error,
+		"actual_ua":   info.ActualUA,
+		"actual_viewport_width":  info.ActualViewportWidth,
+		"actual_viewport_height": info.ActualViewportHeight,
+		// 前端需要的 viewport 对象
+		"viewport": map[string]interface{}{
+			"width":  info.ViewportWidth,
+			"height": info.ViewportHeight,
+		},
+	}
+	// 如果在线，从浏览器实例获取 sdk_ready 和 mod_id（用 Eval 代替 MustEval 防止阻塞）
+	if info.State == "online" {
+		if acc, ok := s.BM.Get(id); ok {
+			if inst := acc.Instance(); inst != nil {
+				if page := inst.Page(); page != nil {
+					if sdkRes, err := page.Eval(`() => !!(window.__sdkInst && window.__imCtx)`); err == nil {
+						if v, ok := sdkRes.Value.Val().(bool); ok {
+							account["sdk_ready"] = v
+						}
+					}
+					if modRes, err := page.Eval(`() => window.__obModId || 0`); err == nil {
+						account["mod_id"] = modRes.Value.Val()
+					}
+				}
+			}
+		}
+	}
+	writeJSONRaw(w, map[string]interface{}{"ok": true, "account": account})
 }
 
 // handleAccountStart POST /api/webui/accounts/{id}/start。
@@ -306,8 +359,20 @@ func (s *Server) handleAccountQRCode(w http.ResponseWriter, r *http.Request) {
 	writeJSONRaw(w, map[string]interface{}{"ok": true, "image_base64": b64, "token": inst.QRToken(), "state": acc.State()})
 }
 
+// handleAccountRecheckLogin POST /api/webui/accounts/{id}/recheck-login
+// 手动重新检测登录状态（恢复 watchLogin 超时后卡住的 qr_pending）。
+func (s *Server) handleAccountRecheckLogin(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	loggedIn, err := s.BM.RecheckLogin(id)
+	if err != nil {
+		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": err.Error(), "logged_in": false})
+		return
+	}
+	writeJSONRaw(w, map[string]interface{}{"ok": true, "logged_in": loggedIn})
+}
+
 // handleAccountWaitLogin GET /api/webui/accounts/{id}/wait-login?timeout=180
-// 长轮询：驱动扫码确认→SDK初始化→置online 全流程。
+// 长轮询：通过轮询页面内部登录态变量（userInfoStore）检测登录，登录后自动初始化 SDK。
 func (s *Server) handleAccountWaitLogin(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	acc, ok := s.BM.Get(id)
@@ -356,15 +421,13 @@ func (s *Server) handleAccountWaitLogin(w http.ResponseWriter, r *http.Request) 
 					writeJSONRaw(w, map[string]interface{}{"ok": false, "logged_in": false, "error": ferr.Error()})
 					return
 				}
+				// 启动后台 SDK + 健康监控 + 消息轮询
+				go s.BM.InitSDKBackground(acc, inst, id)
 				continue // 下一轮循环报告 online
 			case errors.Is(werr, context.DeadlineExceeded), errors.Is(werr, context.Canceled):
-				// 二维码超时未扫/客户端断开 → 继续外层循环直至总超时
+				// 客户端断开或内部超时 → 继续外层循环直至总超时
 				continue
 			default:
-				if strings.Contains(werr.Error(), "过期") {
-					writeJSONRaw(w, map[string]interface{}{"ok": false, "logged_in": false, "expired": true, "error": "二维码已过期，请重新获取"})
-					return
-				}
 				log.Printf("[WebUI] wait-login 轮询异常: %v", werr)
 			}
 		}

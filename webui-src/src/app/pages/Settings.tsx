@@ -48,8 +48,12 @@ function SectionTitle({ icon: Icon, title, description }: { icon: React.ElementT
 export function SettingsPage() {
   const [activeTab, setActiveTab] = useState('connection');
   const [backendVersion, setBackendVersion] = useState('');
+  const [listenAddr, setListenAddr] = useState('');
 
-  useEffect(() => { api.getVersion().then((v) => setBackendVersion(v)).catch(() => {}); }, []);
+  useEffect(() => {
+    api.getVersion().then((v) => setBackendVersion(v)).catch(() => {});
+    api.getSettings().then((s) => setListenAddr(s.listen_addr || '')).catch(() => {});
+  }, []);
 
   return (
     <section className='w-full max-w-[1200px] mx-auto py-4 md:py-8 px-2 md:px-6 relative'>
@@ -82,7 +86,7 @@ export function SettingsPage() {
           <SecurityTab />
         </TabsContent>
         <TabsContent value='about' className='w-full relative p-0'>
-          <AboutTab backendVersion={backendVersion} />
+          <AboutTab backendVersion={backendVersion} listenAddr={listenAddr} />
         </TabsContent>
       </Tabs>
     </section>
@@ -247,7 +251,8 @@ function SecurityTab() {
   );
 }
 
-function AboutTab({ backendVersion }: { backendVersion: string }) {
+function AboutTab({ backendVersion, listenAddr }: { backendVersion: string; listenAddr: string }) {
+  const displayPort = listenAddr ? listenAddr.split(':').pop() || '17836' : '17836';
   return (
     <ConfigPageItem>
       <SectionTitle icon={Info} title='关于' description='系统版本和运行状态' />
@@ -258,7 +263,7 @@ function AboutTab({ backendVersion }: { backendVersion: string }) {
         </div>
         <div className='flex justify-between'>
           <span className='text-gray-500'>运行端口</span>
-          <span className='text-gray-900 dark:text-white'>17836</span>
+          <span className='text-gray-900 dark:text-white'>{displayPort}</span>
         </div>
         <div className='flex justify-between'>
           <span className='text-gray-500'>协议</span>

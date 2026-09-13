@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { HashRouter, Redirect, useRouter } from '@/lib/router';
 import { useAuthStore } from '@/stores/authStore';
+import { useAccountStore } from '@/stores/accountStore';
 import { MainLayout } from '@/components/layout/MainLayout';
 import { Login } from '@/app/pages/Login';
 import { Setup } from '@/app/pages/Setup';
@@ -10,6 +11,7 @@ import { AccountDetail } from '@/app/pages/AccountDetail';
 import { SettingsPage } from '@/app/pages/Settings';
 import { Loader2 } from 'lucide-react';
 import { createContext, useContext } from 'react';
+import { useSSE } from '@/hooks/useSSE';
 
 function AuthGate({ children, requireAuth }: { children: React.ReactNode; requireAuth: boolean }) {
   const { isAuthenticated, isLoading, initialized } = useAuthStore();
@@ -122,6 +124,14 @@ function AppRoutes() {
 
 export default function App() {
   const { checkAuth } = useAuthStore();
+  const { updateAccountStatus } = useAccountStore();
+
+  // SSE 实时推送：账号状态变更自动刷新 store
+  useSSE({
+    onAccountStatus: (accountId, status) => {
+      updateAccountStatus(accountId, status);
+    },
+  });
 
   useEffect(() => {
     checkAuth();

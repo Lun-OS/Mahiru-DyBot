@@ -31,15 +31,11 @@ func (c *ActionContext) Bind(v interface{}) error {
 	return json.Unmarshal(c.RawParams, v)
 }
 
-// AccountIDParam 返回请求中的账号路由标识（account_id 优先，其次 self_id）。
+// AccountIDParam 返回请求中的账号路由标识（self_id）。
+// 返回的是容器 ID（用于 BM.Resolve）。
 func (c *ActionContext) AccountIDParam() string {
 	if c.Params == nil {
 		return ""
-	}
-	if v, ok := c.Params["account_id"]; ok {
-		if s := ToString(v); s != "" && s != "0" {
-			return s
-		}
 	}
 	if v, ok := c.Params["self_id"]; ok {
 		if s := ToString(v); s != "" && s != "0" {
@@ -98,7 +94,7 @@ func (s *Server) Dispatch(action string, rawParams json.RawMessage, echo interfa
 }
 
 // resolveAccount 在 handler 内部解析目标账号：
-//   - 参数带 account_id / self_id → 定向（须在线）
+//   - 参数带 self_id → 定向（须在线）
 //   - 未指定 → 仅一个在线账号时自动选择；多个/零个则报错
 func (s *Server) resolveAccount(ctx *ActionContext) (*browser.Account, *ActionResult) {
 	id := ctx.AccountIDParam()
@@ -143,6 +139,82 @@ func extractText(v interface{}) string {
 		return sb.String()
 	default:
 		return ToString(v)
+	}
+}
+
+// resolveImageData 从 OneBot message segment 的 data 中提取图片内容。
+// 支持 OneBot v11 标准 file 字段格式：base64://、http(s)://、file://、纯 base64、纯 URL
+func resolveImageData(d map[string]interface{}) string {
+	// 优先读 file 字段（OneBot v11 标准）
+	if file, _ := d["file"].(string); file != "" {
+		return file
+	}
+	// 兼容 url 字段
+	if url, _ := d["url"].(string); url != "" {
+		return url
+	}
+	// 兼容 base64 字段
+	if b64, _ := d["base64"].(string); b64 != "" {
+		if strings.HasPrefix(b64, "base64://") {
+			return b64
+		}
+		return "base64://" + b64
+	}
+	return ""
+}
+
+// extractMessageType 从 OneBot 消息中提取消息类型和内容。
+// 返回值：msgType (text/image/sticker), content (原始数据，保留 file 前缀)
+func extractMessageType(v interface{}) (msgType string, content string) {
+	switch t := v.(type) {
+	case string:
+		return "text", t
+	case []interface{}:
+		var textParts []string
+		var imageData string
+		var stickerData string
+
+		for _, seg := range t {
+			if m, ok := seg.(map[string]interface{}); ok {
+				segType := ""
+				if mt, _ := m["type"].(string); mt != "" {
+					segType = mt
+				}
+
+				d, _ := m["data"].(map[string]interface{})
+				if d == nil {
+					continue
+				}
+
+				switch segType {
+				case "text":
+					if txt, _ := d["text"].(string); txt != "" {
+						textParts = append(textParts, txt)
+					}
+				case "image":
+					if v := resolveImageData(d); v != "" {
+						imageData = v
+					}
+				case "sticker":
+					if v := resolveImageData(d); v != "" {
+						stickerData = v
+					}
+				}
+			}
+		}
+
+		if stickerData != "" {
+			return "sticker", stickerData
+		}
+		if imageData != "" {
+			return "image", imageData
+		}
+		if len(textParts) > 0 {
+			return "text", strings.Join(textParts, "")
+		}
+		return "", ""
+	default:
+		return "text", ToString(v)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -162,7 +163,29 @@ func (ar *AdapterRuntime) dialReverseOnce() error {
 	}
 	// OneBot v11 规范：Token 通过 Authorization Header 传输
 	headers := http.Header{}
-	headers.Set("X-Self-ID", ar.accountID)
+	// X-Self-ID 必须使用 UID（纯数字），不能用容器 ID
+	// 使用 AccountID（容器 ID）查找账号获取 UID
+	selfIDHeader := ""
+	if ar.accountID != "" {
+		if acc, ok := ar.srv.BM.Get(ar.accountID); ok {
+			// 检查账号状态，非 online 状态不连接（避免 zombie 连接）
+			if info, iok := ar.srv.BM.Info(ar.accountID); iok && info.State != "online" {
+				return fmt.Errorf("账号 %s 状态为 %s，暂不连接", ar.accountID, info.State)
+			}
+			if inst := acc.Instance(); inst != nil {
+				if uid := inst.SelfUID(); uid != "" {
+					selfIDHeader = uid
+				}
+			} else if acc.Meta.UID != "" {
+				selfIDHeader = acc.Meta.UID
+			}
+		}
+	}
+	// 无法获取有效 UID 时不连接（避免 zombie 连接）
+	if selfIDHeader == "" || selfIDHeader == "0" {
+		return fmt.Errorf("账号 %s 无法获取有效 UID，暂不连接", ar.accountID)
+	}
+	headers.Set("X-Self-ID", selfIDHeader)
 	headers.Set("X-Client-Role", "Universal")
 	headers.Set("User-Agent", "OneBot/11 (mahiru) Mahiru-DyBot/1.0")
 	if ar.adapter.Token != "" {
@@ -183,13 +206,15 @@ func (ar *AdapterRuntime) dialReverseOnce() error {
 	}
 
 	// OneBot v11 规范：连接成功后发送 lifecycle/connect 生命周期事件
-	selfID, _ := parseI64(ar.accountID)
+	// self_id 必须使用 UID（纯数字），不能用容器 ID
+	connectSelfIDInt, _ := parseI64(selfIDHeader)
 	connectEvent := map[string]interface{}{
 		"time":            time.Now().Unix(),
-		"self_id":         selfID,
+		"self_id":         connectSelfIDInt,
 		"post_type":       "meta_event",
 		"meta_event_type": "lifecycle",
 		"sub_type":        "connect",
+		"ping_interval":   30000,
 	}
 	if connectJSON, err := json.Marshal(connectEvent); err == nil {
 		ar.trySend(connectJSON)

@@ -14,6 +14,7 @@ import (
 // ReverseWSConfig 单条反向 WebSocket 连接配置。
 type ReverseWSConfig struct {
 	ID          string `json:"id"`
+	AccountID   string `json:"account_id,omitempty"`   // 关联的账号容器 ID（用于 X-Self-ID 查找 UID）
 	URL         string `json:"url"`                    // 例 ws://127.0.0.1:8080/onebot/v11/ws
 	AccessToken string `json:"access_token,omitempty"` // 拨号时追加 ?access_token=
 	Enabled     bool   `json:"enabled"`

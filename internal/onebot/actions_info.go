@@ -26,7 +26,7 @@ const (
 func actGetVersionInfo(ctx *ActionContext) *ActionResult {
 	return okResult(VersionInfo{
 		AppName:         appName,
-		Version:         appVersion,
+		AppVersion:      appVersion,
 		ProtocolVersion: "v11",
 	}, ctx.Echo)
 }
@@ -84,12 +84,15 @@ func actGetLoginInfo(ctx *ActionContext) *ActionResult {
 		Connection: sdkStatus.ConnectionStatus,
 	}
 	if loginCheck.User != nil {
-		info.SecUID = loginCheck.User.SecUID
-		info.UniqueID = loginCheck.User.UniqueID
+		info.Qid = loginCheck.User.UniqueID
 		info.ShortID = loginCheck.User.ShortID
 		info.Avatar = loginCheck.User.Avatar
 		info.Signature = loginCheck.User.Signature
-		info.Gender = loginCheck.User.Gender
+		if loginCheck.User.Gender == 1 {
+			info.Sex = "male"
+		} else if loginCheck.User.Gender == 2 {
+			info.Sex = "female"
+		}
 		if loginCheck.User.UID != "" {
 			if n, err := strconv.ParseInt(loginCheck.User.UID, 10, 64); err == nil {
 				info.UserID = n
@@ -125,11 +128,11 @@ func actGetFriendList(ctx *ActionContext) *ActionResult {
 				UserID:   id,
 				Nickname: nickname,
 				Remark:   c.RemarkName,
-				DyID:     c.UniqueID,
+				Qid:      c.UniqueID,
 				ShortID:  c.ShortIDNum,
 				Avatar:   c.Avatar,
 			})
-			ctx.Server.rememberPrivateConv(inst.ID, c.ShortID, c.ToUID)
+			ctx.Server.rememberPrivateConv(inst.SelfUID(), c.ShortID, c.ToUID)
 		}
 	}
 	return okResult(items, ctx.Echo)

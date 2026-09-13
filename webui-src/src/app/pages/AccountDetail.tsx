@@ -52,10 +52,11 @@ const inputClass =
 export function AccountDetail() {
   const { navigate } = useRouter();
   const { id } = useParams();
-  const { accounts, startAccount, stopAccount } = useAccountStore();
+  const { accounts, startAccount, stopAccount, deleteAccount } = useAccountStore();
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('overview');
+  const [deleting, setDeleting] = useState(false);
 
   const account = accounts.find((a) => a.id === id);
 
@@ -74,6 +75,21 @@ export function AccountDetail() {
       console.error('Failed to load account info');
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!id) return;
+    if (!confirm('确定要删除此账号吗？此操作不可恢复。')) return;
+    setDeleting(true);
+    try {
+      await deleteAccount(id);
+      toast.success('账号已删除');
+      navigate('/accounts');
+    } catch (err) {
+      toast.error((err as Error).message || '删除失败');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -98,7 +114,15 @@ export function AccountDetail() {
           </div>
         </div>
         <div className='flex items-center gap-2'>
-          {account?.state === 'online' ? (
+          {account?.state === 'starting' ? (
+            <motion.button
+              disabled
+              className='flex items-center gap-2 px-4 py-2 text-sm font-medium bg-[#165DFF]/50 text-white/70 rounded-lg cursor-not-allowed'
+            >
+              <Loader2 className='w-4 h-4 animate-spin' />
+              启动中...
+            </motion.button>
+          ) : account?.state === 'online' || account?.state === 'qr_pending' || account?.state === 'error' ? (
             <motion.button
               onClick={() => id && stopAccount(id)}
               className='flex items-center gap-2 px-4 py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/30 rounded-lg transition-colors'
@@ -111,21 +135,26 @@ export function AccountDetail() {
           ) : (
             <motion.button
               onClick={() => id && startAccount(id)}
-              disabled={account?.state === 'starting'}
-              className='flex items-center gap-2 px-4 py-2 text-sm font-medium bg-[#165DFF] text-white hover:bg-[#0047FF] dark:bg-white dark:text-black dark:hover:bg-gray-200 rounded-lg transition-colors disabled:opacity-50'
+              className='flex items-center gap-2 px-4 py-2 text-sm font-medium bg-[#165DFF] text-white hover:bg-[#0047FF] dark:bg-white dark:text-black dark:hover:bg-gray-200 rounded-lg transition-colors'
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
             >
-              {account?.state === 'starting' ? (
-                <Loader2 className='w-4 h-4 animate-spin' />
-              ) : (
-                <Play className='w-4 h-4' />
-              )}
+              <Play className='w-4 h-4' />
               启动
             </motion.button>
           )}
           <motion.button
-            onClick={loadAccountInfo}
+            onClick={handleDelete}
+            disabled={deleting}
+            className='flex items-center gap-2 px-4 py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/30 rounded-lg transition-colors disabled:opacity-50'
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+          >
+            {deleting ? <Loader2 className='w-4 h-4 animate-spin' /> : <Trash2 className='w-4 h-4' />}
+            删除
+          </motion.button>
+          <motion.button
+            onClick={() => { loadAccountInfo(); }}
             className='p-2 text-gray-500 dark:text-gray-400 hover:text-[#165DFF] dark:hover:text-white hover:bg-gray-100 dark:hover:bg-white/[0.05] rounded-lg transition-colors'
             whileHover={{ rotate: 180 }}
             transition={{ duration: 0.3 }}
@@ -723,13 +752,15 @@ function LogsTab({ accountId }: { accountId: string }) {
   const [searchKeyword, setSearchKeyword] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | 'send' | 'recv' | 'info'>('all');
   const logsContainerRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const logsRef = useRef<string[]>([]);
+  const accountIdRef = useRef(accountId);
+  accountIdRef.current = accountId;
 
   const fetchLogs = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.getAccountLogs(accountId, 100);
+      logsRef.current = data;
       setLogs(data);
     } catch {}
     setIsLoading(false);
@@ -737,30 +768,42 @@ function LogsTab({ accountId }: { accountId: string }) {
 
   useEffect(() => { fetchLogs(); }, [fetchLogs]);
 
+  // SSE 实时日志推送
   useEffect(() => {
+    const token = api.getToken();
+    if (!token) return;
     let stopped = false;
-    const connect = async () => {
-      try {
-        const url = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/webui/events`;
-        const ws = new WebSocket(url);
-        wsRef.current = ws;
-        ws.onopen = () => { if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; } };
-        ws.onmessage = (event) => {
-          if (stopped) return;
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'log' && data.account_id === accountId && data.message) {
-              setLogs(prev => { const next = [...prev, data.message]; return next.length > 100 ? next.slice(-100) : next; });
-            }
-          } catch {}
-        };
-        ws.onclose = () => { if (!stopped) { wsRef.current = null; reconnectTimerRef.current = setTimeout(() => { if (!stopped) connect(); }, 3000); } };
-        ws.onerror = () => { ws.close(); };
-      } catch {}
+    let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (stopped) return;
+      const url = `/api/webui/events?token=${encodeURIComponent(token)}`;
+      es = new EventSource(url);
+      es.onmessage = (event) => {
+        if (stopped) return;
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'log' && msg.data.account_id === accountIdRef.current && typeof msg.data.message === 'string') {
+            logsRef.current = [...logsRef.current.slice(-99), msg.data.message];
+            setLogs([...logsRef.current]);
+          }
+        } catch {}
+      };
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (!stopped) reconnectTimer = setTimeout(connect, 3000);
+      };
     };
+
     connect();
-    return () => { stopped = true; if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current); if (wsRef.current) wsRef.current.close(); };
-  }, [accountId]);
+    return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      es?.close();
+    };
+  }, []);
 
   const getLogType = (log: string): 'send' | 'recv' | 'info' => {
     if (log.includes('[send]')) return 'send';

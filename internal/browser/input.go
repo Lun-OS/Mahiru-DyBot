@@ -1,14 +1,15 @@
 package browser
 
 // 实时输入会话与画面捕获：
-//   - InputSession: 基于 Playwright 鼠标/键盘 API 的增量输入注入
-//   - CaptureJPEG: Playwright 原生 JPEG 截图
+//   - InputSession: 基于 Rod 鼠标/键盘 API 的增量输入注入
+//   - CaptureJPEG: Rod JPEG 截图
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/playwright-community/playwright-go"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // InputSession 单账号的持久输入通道。
@@ -48,7 +49,8 @@ func (s *InputSession) MouseMove(x, y float64, pressed bool) error {
 	if page == nil {
 		return fmt.Errorf("页面未就绪")
 	}
-	return page.Mouse().Move(x, y)
+	page.Mouse.MustMoveTo(x, y)
+	return nil
 }
 
 // MouseDown 在坐标处按下左键。
@@ -60,11 +62,10 @@ func (s *InputSession) MouseDown(x, y float64) error {
 	if page == nil {
 		return fmt.Errorf("页面未就绪")
 	}
-	if err := page.Mouse().Move(x, y); err != nil {
-		return err
-	}
+	page.Mouse.MustMoveTo(x, y)
 	time.Sleep(15 * time.Millisecond)
-	return page.Mouse().Down()
+	page.Mouse.MustDown(proto.InputMouseButtonLeft)
+	return nil
 }
 
 // MouseUp 抬起左键。
@@ -76,10 +77,11 @@ func (s *InputSession) MouseUp(x, y float64) error {
 	if page == nil {
 		return fmt.Errorf("页面未就绪")
 	}
-	return page.Mouse().Up()
+	page.Mouse.MustUp(proto.InputMouseButtonLeft)
+	return nil
 }
 
-// KeyPress 按键透传给 Playwright 键盘（名称如 Enter/Escape/a/1）。
+// KeyPress 按键透传给 Rod 键盘（名称如 Enter/Escape/a/1）。
 func (s *InputSession) KeyPress(key string) error {
 	in := s.inst
 	in.mu.Lock()
@@ -87,7 +89,8 @@ func (s *InputSession) KeyPress(key string) error {
 	if in.page == nil {
 		return fmt.Errorf("页面未就绪")
 	}
-	return in.page.Keyboard().Press(key)
+	in.page.Keyboard.MustType(parseKey(key))
+	return nil
 }
 
 // MouseScroll 在指定坐标处滚动鼠标滚轮。deltaX/Y 正值=向下/向右。
@@ -99,11 +102,10 @@ func (s *InputSession) MouseScroll(x, y float64, deltaX, deltaY int) error {
 	if page == nil {
 		return fmt.Errorf("页面未就绪")
 	}
-	if err := page.Mouse().Move(x, y); err != nil {
-		return err
-	}
+	page.Mouse.MustMoveTo(x, y)
 	time.Sleep(10 * time.Millisecond)
-	return page.Mouse().Wheel(float64(deltaX), float64(deltaY))
+	page.Mouse.MustScroll(float64(deltaX), float64(deltaY))
+	return nil
 }
 
 // CaptureJPEG 全页 JPEG 截图。返回编码数据与视口尺寸。
@@ -114,14 +116,9 @@ func (in *Instance) CaptureJPEG(quality int) ([]byte, int, int, error) {
 	if page == nil {
 		return nil, 0, 0, fmt.Errorf("页面未就绪")
 	}
-	opts := playwright.PageScreenshotOptions{
-		Type:    playwright.ScreenshotTypeJpeg,
-		Quality: playwright.Int(quality),
-	}
-	data, err := page.Screenshot(opts)
-	if err != nil {
-		return nil, 0, 0, err
-	}
+	data := page.MustScreenshot()
 	w, h := in.ViewportSize()
 	return data, int(w), int(h), nil
 }
+
+var _ = rod.Try

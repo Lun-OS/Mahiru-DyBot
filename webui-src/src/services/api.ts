@@ -155,10 +155,6 @@ class ApiClient {
     throw new Error(res.error || 'Login wait failed');
   }
 
-  async updateAccountToken(id: string, token: string): Promise<void> {
-    await this.post(`/accounts/${id}/token`, { token });
-  }
-
   async updateAccountSettings(
     id: string,
     settings: { name?: string; viewport_width?: number; viewport_height?: number; custom_ua?: string }
@@ -226,12 +222,13 @@ class ApiClient {
     const res = await this.get<{
       ok: boolean;
       onebot_access_token: string;
+      listen_addr: string;
       screenshot_max_fps: number;
       jpeg_quality: number;
       reverse_ws: unknown[];
     }>('/settings');
     return {
-      listen_addr: '',
+      listen_addr: res.listen_addr || '',
       onebot_access_token: res.onebot_access_token || '',
       screenshot_max_fps: res.screenshot_max_fps || 10,
       jpeg_quality: res.jpeg_quality || 60,
@@ -263,7 +260,8 @@ class ApiClient {
   }
 
   async getVersion(): Promise<string> {
-    return '1.0.0';
+    const res = await this.get<{ ok: boolean; version: string }>('/version');
+    return res.version || '1.0.0';
   }
 
   // Adapter methods (per-account)

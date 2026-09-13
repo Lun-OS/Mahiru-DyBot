@@ -199,7 +199,20 @@ export function AccountList() {
 
 function AccountCard({ account, onClick }: { account: Account; onClick: () => void }) {
   const isOnline = account.state === 'online';
+  const isStarting = account.state === 'starting';
+  const isError = account.state === 'error';
   const nickname = account.name || account.uid || '未命名';
+
+  const stateLabel = isOnline ? '在线' : isStarting ? '启动中' : isError ? '异常' : account.state === 'qr_pending' ? '待扫码' : '离线';
+  const stateColor = isOnline
+    ? 'bg-green-500 dark:bg-green'
+    : isStarting
+      ? 'bg-yellow-500 dark:bg-yellow'
+      : isError
+        ? 'bg-red-500 dark:bg-red'
+        : account.state === 'qr_pending'
+          ? 'bg-amber-500 dark:bg-amber'
+          : 'bg-gray-400 dark:bg-gray-600';
 
   return (
     <div
@@ -212,9 +225,7 @@ function AccountCard({ account, onClick }: { account: Account; onClick: () => vo
             {nickname[0]?.toUpperCase() || 'D'}
           </div>
           <span
-            className={`absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full border-2 border-black ${
-              isOnline ? 'bg-green-500 dark:bg-green' : 'bg-gray-400 dark:bg-gray-600'
-            }`}
+            className={`absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full border-2 border-black ${stateColor}`}
           />
         </div>
 
@@ -223,17 +234,10 @@ function AccountCard({ account, onClick }: { account: Account; onClick: () => vo
             <h3 className='text-sm font-semibold text-gray-900 dark:text-white truncate'>
               {nickname}
             </h3>
-            {isOnline ? (
-              <span className='inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-50 text-blue-700 dark:bg-white/[0.06] dark:text-gray-300'>
-                <Wifi className='w-2.5 h-2.5' />
-                在线
-              </span>
-            ) : (
-              <span className='inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-50 text-blue-700 dark:bg-white/[0.06] dark:text-gray-300'>
-                <WifiOff className='w-2.5 h-2.5' />
-                离线
-              </span>
-            )}
+            <span className='inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-50 text-blue-700 dark:bg-white/[0.06] dark:text-gray-300'>
+              {isOnline ? <Wifi className='w-2.5 h-2.5' /> : <WifiOff className='w-2.5 h-2.5' />}
+              {stateLabel}
+            </span>
           </div>
 
           <div className='flex items-center gap-3 mt-1.5 text-xs text-gray-600 dark:text-gray-400'>

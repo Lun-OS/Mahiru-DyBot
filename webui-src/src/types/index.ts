@@ -3,10 +3,9 @@ export interface Account {
   id: string;
   name: string;
   uid: string;
+  nickname: string;
   state: AccountState;
-  onebot_token: string;
-  created_at: string;
-  last_active: string;
+  created_at: number;
   error?: string;
 }
 
@@ -55,18 +54,19 @@ export interface AccountInfo {
   id: string;
   name: string;
   uid: string;
-  state: AccountState;
   nickname: string;
-  avatar: string;
-  viewport: { width: number; height: number };
+  state: AccountState;
+  created_at: number;
+  error?: string;
   viewport_width: number;
   viewport_height: number;
+  viewport: { width: number; height: number };
   custom_ua: string;
   actual_ua: string;
   actual_viewport_width: number;
   actual_viewport_height: number;
-  sdk_ready: boolean;
-  mod_id: number;
+  sdk_ready?: boolean;
+  mod_id?: number;
 }
 
 // SSE Event types

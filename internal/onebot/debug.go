@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"mahiru-dybot/internal/browser"
+	"github.com/go-rod/rod"
 )
 
 // screenshotLimiter 截图限速器（fps 运行时读取，可热更）。
@@ -49,6 +51,20 @@ func (s *Server) resolveDebugTarget(w http.ResponseWriter, r *http.Request) (*br
 	return acc, inst, true
 }
 
+// resolvePage 解析账号并返回就绪的页面，未就绪时写错误响应。
+func (s *Server) resolvePage(w http.ResponseWriter, r *http.Request) (*browser.Account, *browser.Instance, *rod.Page, bool) {
+	acc, inst, ok := s.resolveDebugTarget(w, r)
+	if !ok {
+		return nil, nil, nil, false
+	}
+	page := inst.Page()
+	if page == nil {
+		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": "页面未就绪，浏览器仍在初始化中"})
+		return nil, nil, nil, false
+	}
+	return acc, inst, page, true
+}
+
 // handleDebugScreenshot GET /api/webui/accounts/{id}/screenshot → PNG。
 func (s *Server) handleDebugScreenshot(w http.ResponseWriter, r *http.Request) {
 	fps := s.RT.Get().ScreenshotMaxFPS
@@ -56,15 +72,11 @@ func (s *Server) handleDebugScreenshot(w http.ResponseWriter, r *http.Request) {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": fmt.Sprintf("截图过于频繁 (>%dfps)，可调大 screenshot_max_fps", fps)})
 		return
 	}
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, _, page, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
-	png, err := inst.Page().Screenshot()
-	if err != nil {
-		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": err.Error()})
-		return
-	}
+	png := page.MustScreenshot()
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(png)
@@ -72,31 +84,36 @@ func (s *Server) handleDebugScreenshot(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugConsole GET /api/webui/accounts/{id}/console → 页面状态。
 func (s *Server) handleDebugConsole(w http.ResponseWriter, r *http.Request) {
-	acc, inst, ok := s.resolveDebugTarget(w, r)
+	acc, _, page, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
-	page := inst.Page()
-	title, _ := page.Evaluate("document.title")
-	url, _ := page.Evaluate("location.href")
-	loggedIn, _ := page.Evaluate(`!!(window.userInfoStore && window.userInfoStore.curLoginUserInfo)`)
-	bodyLen, _ := page.Evaluate(`document.body ? document.body.innerHTML.length : 0`)
-	wpAvail, _ := page.Evaluate(`typeof window.webpackChunkdouyin_web`)
+	var title, url, wpAvail interface{}
+	var loggedIn, bodyLen interface{}
+	rod.Try(func() {
+		title = page.MustEval(`() => document.title`).Val()
+		url = page.MustEval(`() => location.href`).Val()
+		loggedIn = page.MustEval(`() => !!(window.userInfoStore && window.userInfoStore.curLoginUserInfo)`).Val()
+		bodyLen = page.MustEval(`() => document.body ? document.body.innerHTML.length : 0`).Val()
+		wpAvail = page.MustEval(`() => typeof window.webpackChunkdouyin_web`).Val()
+	})
 
 	writeJSONRaw(w, map[string]interface{}{
-		"ok":        true,
-		"account":   acc.Meta,
-		"title":     title,
-		"url":       url,
-		"logged_in": loggedIn,
-		"body_len":  bodyLen,
-		"webpack":   wpAvail,
+		"ok": true,
+		"data": map[string]interface{}{
+			"account":   acc.Meta,
+			"title":     title,
+			"url":       url,
+			"logged_in": loggedIn,
+			"body_len":  bodyLen,
+			"webpack":   wpAvail,
+		},
 	})
 }
 
 // handleDebugEval POST {js} → 执行结果。
 func (s *Server) handleDebugEval(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, _, page, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -108,18 +125,33 @@ func (s *Server) handleDebugEval(w http.ResponseWriter, r *http.Request) {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": "需要 {\"js\": \"...\"}"})
 		return
 	}
-	res, err := inst.Page().Evaluate(req.JS)
+	js := req.JS
+	// 自动包装：如果用户代码不是以箭头函数/函数开头，则包装为箭头函数
+	trimmed := strings.TrimSpace(js)
+	if !strings.HasPrefix(trimmed, "()") &&
+		!strings.HasPrefix(trimmed, "async") &&
+		!strings.HasPrefix(trimmed, "(async") &&
+		!strings.HasPrefix(trimmed, "(function") &&
+		!strings.HasPrefix(trimmed, "function") {
+		if strings.HasPrefix(trimmed, "return ") {
+			// `return x` → `() => { return x }`
+			js = "() => { " + js + " }"
+		} else {
+			js = "() => " + js
+		}
+	}
+	res, err := page.Eval(js)
 	if err != nil {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
-	b, _ := json.Marshal(res)
-	writeJSONRaw(w, map[string]interface{}{"ok": true, "result": json.RawMessage(b)})
+	b, _ := json.Marshal(res.Value.Val())
+	writeJSONRaw(w, map[string]interface{}{"ok": true, "data": json.RawMessage(b)})
 }
 
 // handleDebugClick POST {x,y} → 模拟真实点击（含前置移动轨迹）。
 func (s *Server) handleDebugClick(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, page, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -132,17 +164,20 @@ func (s *Server) handleDebugClick(w http.ResponseWriter, r *http.Request) {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": "需要 {\"x\": number, \"y\": number}"})
 		return
 	}
-	elInfo, _ := inst.Page().Evaluate(fmt.Sprintf(`(function() {
-		var el = document.elementFromPoint(%f, %f);
-		if (!el) return {error: 'no element'};
-		return {
-			tag: el.tagName,
-			id: el.id,
-			className: el.className,
-			text: (el.textContent || '').substring(0, 100),
-			rect: el.getBoundingClientRect ? JSON.parse(JSON.stringify(el.getBoundingClientRect())) : null
-		};
-	})()`, req.X, req.Y))
+	var elInfo interface{}
+	rod.Try(func() {
+		elInfo = page.MustEval(fmt.Sprintf(`() => {
+			var el = document.elementFromPoint(%f, %f);
+			if (!el) return {error: 'no element'};
+			return {
+				tag: el.tagName,
+				id: el.id,
+				className: el.className,
+				text: (el.textContent || '').substring(0, 100),
+				rect: el.getBoundingClientRect ? JSON.parse(JSON.stringify(el.getBoundingClientRect())) : null
+			};
+		}`, req.X, req.Y)).Val()
+	})
 
 	if err := inst.Click(req.X, req.Y); err != nil {
 		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": err.Error()})
@@ -153,7 +188,7 @@ func (s *Server) handleDebugClick(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugDrag POST {from_x,from_y,to_x,to_y,[steps]} → 人手轨迹拖拽（滑块验证）。
 func (s *Server) handleDebugDrag(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -186,7 +221,7 @@ func (s *Server) handleDebugDrag(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugKey POST {key} → 模拟按键（Enter/Escape/Tab/Backspace 等）。
 func (s *Server) handleDebugKey(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -214,7 +249,7 @@ func absF(v float64) float64 {
 
 // handleDebugType POST {x,y,text} → 点击后键入。
 func (s *Server) handleDebugType(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -237,7 +272,7 @@ func (s *Server) handleDebugType(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugScroll POST {x,y,delta_x,delta_y} → 鼠标滚轮。
 func (s *Server) handleDebugScroll(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -261,7 +296,7 @@ func (s *Server) handleDebugScroll(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugRightClick POST {x,y} → 右键点击。
 func (s *Server) handleDebugRightClick(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -283,7 +318,7 @@ func (s *Server) handleDebugRightClick(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugViewport GET → 视口大小。
 func (s *Server) handleDebugViewport(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, inst, _, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
@@ -293,19 +328,25 @@ func (s *Server) handleDebugViewport(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugHTML GET → 页面HTML(前50KB)。
 func (s *Server) handleDebugHTML(w http.ResponseWriter, r *http.Request) {
-	_, inst, ok := s.resolveDebugTarget(w, r)
+	_, _, page, ok := s.resolvePage(w, r)
 	if !ok {
 		return
 	}
-	html, err := inst.Page().Evaluate(`document.documentElement.outerHTML`)
-	if err != nil {
-		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": err.Error()})
+	var htmlStr string
+	rod.Try(func() {
+		res := page.MustEval(`() => document.documentElement.outerHTML`)
+		htmlStr = res.Str()
+		if htmlStr == "" {
+			b, _ := json.Marshal(res.Val())
+			htmlStr = string(b)
+		}
+	})
+	if htmlStr == "" {
+		writeJSONRaw(w, map[string]interface{}{"ok": false, "error": "获取页面 HTML 失败"})
 		return
 	}
-	htmlStr := fmt.Sprintf("%v", html)
 	if len(htmlStr) > 50000 {
 		htmlStr = htmlStr[:50000] + "\n... (truncated)"
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(htmlStr))
+	writeJSONRaw(w, map[string]interface{}{"ok": true, "html": htmlStr})
 }

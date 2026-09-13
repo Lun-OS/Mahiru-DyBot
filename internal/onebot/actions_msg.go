@@ -2,7 +2,76 @@ package onebot
 
 // 消息操作类 action：撤回/删除/点赞/回复。
 
-import "strconv"
+import (
+	"strconv"
+)
+
+// transformSDKMsgToOneBot 将原始 SDK 消息转换为 OneBot v11 格式。
+func transformSDKMsgToOneBot(msg map[string]interface{}, inst interface {
+	SelfUID() string
+	SelfNickname() string
+	GetUserNickname(uid string) string
+}) map[string]interface{} {
+	clientID, _ := msg["clientId"].(string)
+	senderUID, _ := msg["sender"].(string)
+	text, _ := msg["text"].(string)
+	contentRaw, _ := msg["content"].(string)
+	createdAt, _ := msg["createdAt"].(float64)
+
+	selfUIDStr := inst.SelfUID()
+	selfUID, _ := strconv.ParseInt(selfUIDStr, 10, 64)
+	senderUIDInt, _ := strconv.ParseInt(senderUID, 10, 64)
+
+	isFromMe := senderUID == selfUIDStr
+	var nickname string
+	if isFromMe {
+		nickname = inst.SelfNickname()
+	} else {
+		nickname = inst.GetUserNickname(senderUID)
+	}
+
+	if nickname == "" {
+		nickname = strconv.FormatInt(senderUIDInt, 10)
+	}
+
+	postType := "message"
+	if isFromMe {
+		postType = "message_sent"
+	}
+
+	textContent := text
+	if textContent == "" {
+		textContent = contentRaw
+	}
+
+	msgID := hashStringID(clientID)
+	sender := EventSender{
+		UserID:   senderUIDInt,
+		Nickname: nickname,
+		Card:     "",
+	}
+	result := map[string]interface{}{
+		"self_id":        selfUID,
+		"user_id":        senderUIDInt,
+		"time":           int64(createdAt),
+		"message_id":     msgID,
+		"real_id":        msgID,
+		"message_seq":    msgID,
+		"real_seq":       strconv.FormatInt(msgID, 10),
+		"message_type":   "private",
+		"sender":         sender,
+		"raw_message":    textContent,
+		"font":           14,
+		"sub_type":       "friend",
+		"message":        []interface{}{map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": textContent}}},
+		"message_format": "array",
+		"post_type":      postType,
+	}
+	if isFromMe {
+		result["message_sent_type"] = "self"
+	}
+	return result
+}
 
 func init() {
 	Register("recall_message", actRecallMessage)
@@ -46,14 +115,11 @@ func actGetMsg(ctx *ActionContext) *ActionResult {
 	if result == nil {
 		return failResult(RetCodeNotFound, "消息不存在", ctx.Echo)
 	}
-	var msgIDInt int64
-	if v, err := strconv.ParseInt(serverID, 10, 64); err == nil {
-		msgIDInt = v
+	msgMap, ok := result.(map[string]interface{})
+	if !ok {
+		return failResult(RetCodeInternalErr, "消息格式错误", ctx.Echo)
 	}
-	msg := map[string]interface{}{
-		"message_id": msgIDInt,
-		"raw":        result,
-	}
+	msg := transformSDKMsgToOneBot(msgMap, inst)
 	return okResult(msg, ctx.Echo)
 }
 

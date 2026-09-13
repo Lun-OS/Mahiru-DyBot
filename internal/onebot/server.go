@@ -34,6 +34,8 @@ type Server struct {
 	Bus  *eventbus.Bus
 	SSE  *SSEManager
 
+	WebUI http.FileSystem // 内嵌的 webui 静态文件系统
+
 	mu         sync.RWMutex
 	hub        map[*wsClient]struct{}
 	shortToUID sync.Map // "<accountID>|<convShortID>" -> 对端uid
@@ -46,7 +48,7 @@ type Server struct {
 }
 
 // NewServer 构建服务（不监听）。调用 Start 开始服务。
-func NewServer(addr, udpAddr, wsPath string, bm *browser.AccountManager, authStore *auth.Store, rt *config.Runtime, bus *eventbus.Bus) *Server {
+func NewServer(addr, udpAddr, wsPath string, bm *browser.AccountManager, authStore *auth.Store, rt *config.Runtime, bus *eventbus.Bus, webuiFS http.FileSystem) *Server {
 	s := &Server{
 		Addr:    addr,
 		UdpAddr: udpAddr,
@@ -56,6 +58,7 @@ func NewServer(addr, udpAddr, wsPath string, bm *browser.AccountManager, authSto
 		RT:      rt,
 		Bus:     bus,
 		SSE:     NewSSEManager(),
+		WebUI:   webuiFS,
 		hub:     map[*wsClient]struct{}{},
 		adapterMgrs: map[string]*AccountAdapterManager{},
 	}
@@ -67,6 +70,14 @@ func (s *Server) Start() error {
 	s.reverse = NewReverseManager(s)
 	s.startEventBridge()
 	s.Heartbeat(30 * time.Second)
+
+	// 注册 UID 变化回调：当账号登录成功且 UID 变化时，断开所有 WS 连接并重启适配器
+	s.BM.SetUIDChangedCallback(func(accountID, oldUID, newUID string) {
+		log.Printf("[Server] 账号 %s UID 变化: %s -> %s，断开所有 OneBot 连接并重启适配器", accountID, oldUID, newUID)
+		s.disconnectAllWSClients()
+		// 重启该账号的适配器以使用新的 UID
+		s.restartAdaptersForAccount(accountID)
+	})
 
 	if s.UdpAddr != "" {
 		s.udp = &udpServer{srv: s, sessions: map[string]*udpSession{}}
@@ -83,7 +94,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /webui", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/webui/", http.StatusFound)
 	})
-	mux.HandleFunc("GET /webui/", spaHandler("webui"))
+	mux.HandleFunc("GET /webui/", s.spaFileHandler())
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/webui/", http.StatusFound)
 	})
@@ -101,6 +112,7 @@ func (s *Server) Start() error {
 
 	// ---------- 系统信息 ----------
 	mux.HandleFunc("GET /api/webui/system/info", s.webuiAuthed(s.handleSystemInfo))
+	mux.HandleFunc("GET /api/webui/version", s.handleWebUIVersion)
 
 	// ---------- 账号管理 ----------
 	mux.HandleFunc("GET /api/webui/accounts", s.webuiAuthed(s.handleAccountsList))
@@ -113,6 +125,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/webui/accounts/{id}/settings", s.webuiAuthed(s.handleAccountUpdateSettings))
 	mux.HandleFunc("GET /api/webui/accounts/{id}/qrcode", s.webuiAuthed(s.handleAccountQRCode))
 	mux.HandleFunc("GET /api/webui/accounts/{id}/wait-login", s.webuiAuthed(s.handleAccountWaitLogin))
+	mux.HandleFunc("POST /api/webui/accounts/{id}/recheck-login", s.webuiAuthed(s.handleAccountRecheckLogin))
 
 	// ---------- 账号调试控制 ----------
 	mux.HandleFunc("GET /api/webui/accounts/{id}/screenshot", s.webuiAuthed(s.handleDebugScreenshot))
@@ -139,6 +152,11 @@ func (s *Server) Start() error {
 
 	// ---------- 账号日志 ----------
 	mux.HandleFunc("GET /api/webui/accounts/{id}/logs", s.webuiAuthed(s.handleAccountLogs))
+
+	// ---------- HanChat 兼容 API ----------
+	mux.HandleFunc("GET /api/accounts", s.handleHanChatAccounts)
+	mux.HandleFunc("GET /api/accounts/{selfId}/status", s.handleHanChatAccountStatus)
+	mux.HandleFunc("POST /api/bot/{selfId}/{action}", s.handleHanChatBotAction)
 
 	// ---------- OneBot v11 标准 action ----------
 	// 单段路径 GET/POST 统一分发到注册表（send_private_msg、get_login_info 等）
@@ -193,7 +211,7 @@ func writeActionResult(w http.ResponseWriter, r *ActionResult) {
 
 // startEventBridge 订阅事件总线：
 //   - message → 转 OneBot 消息事件广播（正向+反向）
-//   - account → 账号状态通知广播（调试友好）+ SSE 推送
+//   - account → 账号状态通知广播（调试友好）+ SSE 推送 + 适配器生命周期管理
 func (s *Server) startEventBridge() {
 	sub := s.Bus.Subscribe(eventbus.TopicMessage, eventbus.TopicAccount)
 	go func() {
@@ -230,9 +248,40 @@ func (s *Server) startEventBridge() {
 				})
 				// SSE 推送账号状态
 				s.BroadcastAccountStatus(payload.AccountID, payload.State)
+				// 适配器生命周期管理：根据状态变化自动启停适配器
+				s.handleAdapterLifecycleForStateChange(payload.AccountID, payload.State)
 			}
 		}
 	}()
+}
+
+// handleAdapterLifecycleForStateChange 根据账号状态变化管理适配器生命周期
+func (s *Server) handleAdapterLifecycleForStateChange(accountID, state string) {
+	switch state {
+	case "online":
+		// 账号上线：重启适配器以获取新的 UID（可能 UID 已变化）
+		log.Printf("[EventBridge] 账号 %s 上线，重启适配器", accountID)
+		s.restartAdaptersForAccount(accountID)
+	case "error", "stopped":
+		// 账号出错或停止：停止适配器（避免 zombie 连接）
+		log.Printf("[EventBridge] 账号 %s 状态为 %s，停止适配器", accountID, state)
+		s.StopAccountAdapters(accountID)
+	}
+}
+
+// restartAdaptersForAccount 重启指定账号的适配器
+func (s *Server) restartAdaptersForAccount(accountID string) {
+	s.mu.RLock()
+	_, ok := s.adapterMgrs[accountID]
+	s.mu.RUnlock()
+	if ok {
+		// 获取账号目录
+		accDir, dirOK := s.BM.InstanceDir(accountID)
+		if dirOK && accDir != "" {
+			log.Printf("[EventBridge] 重启账号 %s 适配器", accountID)
+			go s.ReloadAccountAdapters(accountID, accDir)
+		}
+	}
 }
 
 // --- Per-Account Adapter Manager Lifecycle ---

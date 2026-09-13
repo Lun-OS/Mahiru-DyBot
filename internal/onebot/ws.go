@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
-	pingPeriod     = 50 * time.Second
+	pingPeriod     = 30 * time.Second // OneBot v11 标准：30s ping 间隔
 	sendChanBuffer = 256
 )
 
@@ -111,15 +112,45 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	stop := make(chan struct{})
 	go writePump(conn, client.send, stop)
 
-	// 连接生命周期事件（仅推给本连接）
-	lc, _ := json.Marshal(map[string]interface{}{
-		"time":            time.Now().Unix(),
-		"self_id":          0,
-		"post_type":        "meta_event",
-		"meta_event_type":  "lifecycle",
-		"sub_type":         "connect",
-	})
-	client.trySend(lc)
+	// 连接生命周期事件：为每个在线账号发送 lifecycle/connect
+	accounts := s.BM.List()
+	if len(accounts) == 0 {
+		// 没有账号时发送默认的 self_id=0 连接事件（兼容性）
+		lc, _ := json.Marshal(map[string]interface{}{
+			"time":            time.Now().Unix(),
+			"self_id":         0,
+			"post_type":       "meta_event",
+			"meta_event_type": "lifecycle",
+			"sub_type":        "connect",
+			"ping_interval":   30000,
+		})
+		client.trySend(lc)
+	} else {
+		for _, accInfo := range accounts {
+			uidInt := int64(0)
+			// 尝试从运行中的实例获取 UID
+			if acc, ok := s.BM.Get(accInfo.ID); ok {
+				if inst := acc.Instance(); inst != nil {
+					if uid := inst.SelfUID(); uid != "" {
+						uidInt, _ = parseI64(uid)
+					}
+				}
+			}
+			// 回退到元数据中的 UID
+			if uidInt == 0 && accInfo.UID != "" {
+				uidInt, _ = parseI64(accInfo.UID)
+			}
+			lc, _ := json.Marshal(map[string]interface{}{
+				"time":            time.Now().Unix(),
+				"self_id":         uidInt,
+				"post_type":       "meta_event",
+				"meta_event_type": "lifecycle",
+				"sub_type":        "connect",
+				"ping_interval":   30000,
+			})
+			client.trySend(lc)
+		}
+	}
 
 	defer func() {
 		s.mu.Lock()
@@ -176,13 +207,28 @@ func (s *Server) broadcastRaw(data []byte) {
 	if s.reverse != nil {
 		s.reverse.broadcastRaw(data)
 	}
-	// 推送到每账号适配器
-	var partial struct {
-		AccountID string `json:"account_id"`
+}
+
+// disconnectAllWSClients 断开所有 WS 客户端连接。
+// 当账号 UID 变化时调用，强制客户端重新连接以获取新的 self_id。
+func (s *Server) disconnectAllWSClients() {
+	s.mu.Lock()
+	clients := make([]*wsClient, 0, len(s.hub))
+	for c := range s.hub {
+		clients = append(clients, c)
 	}
-	if json.Unmarshal(data, &partial) == nil && partial.AccountID != "" {
-		s.BroadcastToAccountAdapters(partial.AccountID, data)
+	// 清空 hub，这样后续的 Broadcast 不会发送到旧连接
+	s.hub = map[*wsClient]struct{}{}
+	s.mu.Unlock()
+
+	for _, c := range clients {
+		// 发送关闭帧
+		c.conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "UID changed, please reconnect"),
+			time.Now().Add(time.Second))
+		c.conn.Close()
 	}
+	log.Printf("[WS] 已断开 %d 个客户端连接（UID 变化）", len(clients))
 }
 
 // rememberPrivateConv 记录 会话shortId -> 对端uid 映射（按账号隔离）。
@@ -198,12 +244,12 @@ func (s *Server) buildIncomingEvent(acc *browser.AccountInfo, incoming *browser.
 	segments := buildSegments(incoming)
 
 	uidStr := ""
-	if v, ok := s.shortToUID.Load(acc.ID + "|" + incoming.ConversationShortID); ok {
+	if v, ok := s.shortToUID.Load(acc.UID + "|" + incoming.ConversationShortID); ok {
 		uidStr, _ = v.(string)
 	}
 	if uidStr == "" && incoming.Sender != "" && !incoming.IsFromMe {
 		uidStr = incoming.Sender
-		s.rememberPrivateConv(acc.ID, incoming.ConversationShortID, uidStr)
+		s.rememberPrivateConv(acc.UID, incoming.ConversationShortID, uidStr)
 	}
 	uid, _ := parseI64(uidStr)
 	selfID, _ := parseI64(acc.UID)
@@ -216,27 +262,44 @@ func (s *Server) buildIncomingEvent(acc *browser.AccountInfo, incoming *browser.
 	}
 
 	postType := "message"
+	senderID := uid
+	senderNickname := incoming.SenderNickname
 	if incoming.IsFromMe {
 		postType = "message_sent"
+		senderID = selfID
+		if senderNickname == "" {
+			senderNickname = acc.Nickname
+		}
+	}
+	if senderNickname == "" {
+		senderNickname = strconv.FormatInt(uid, 10)
 	}
 
 	rawMsg := formatCQCode(segments)
+	msgID := hashStringID(incoming.ClientID)
 	ev := &EventMessage{
 		Time:        incoming.CreatedAt,
 		SelfID:      selfID,
-		AccountID:   acc.ID,
 		PostType:    postType,
 		MessageType: msgType,
 		SubType:     subType,
-		UserID:      uid,
+		UserID:      senderID,
 		GroupID:     groupID,
 		Message:     rawMsg,
 		RawMessage:  rawMsg,
 		Sender: EventSender{
-			UserID:   uid,
-			Nickname: incoming.SenderNickname,
+			UserID:   senderID,
+			Nickname: senderNickname,
 		},
-		MessageID: hashStringID(incoming.ClientID),
+		MessageID:  msgID,
+		RealID:     msgID,
+		MessageSeq: 1,
+		Image:      incoming.Image,
+		Sticker:    incoming.Sticker,
+		RawContent: incoming.RawContent,
+	}
+	if incoming.IsFromMe {
+		ev.MessageSentType = "self"
 	}
 	return ev
 }
@@ -256,20 +319,48 @@ func hashStringID(s string) int64 {
 	return h
 }
 
-// Heartbeat 周期性心跳事件。
+// Heartbeat 周期性心跳事件（为每个在线账号发送心跳）。
 func (s *Server) Heartbeat(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for t := range ticker.C {
-			ev := EventMeta{
-				Time:          t.Unix(),
-				SelfID:        0,
-				PostType:      "meta_event",
-				MetaEventType: "heartbeat",
-				Interval:      int(interval.Seconds()),
+			accounts := s.BM.List()
+			if len(accounts) == 0 {
+				// 没有账号时发送默认心跳（兼容性）
+				ev := EventMeta{
+					Time:          t.Unix(),
+					SelfID:        0,
+					PostType:      "meta_event",
+					MetaEventType: "heartbeat",
+					Interval:      int(interval.Seconds()),
+				}
+				s.Broadcast(ev)
+			} else {
+				for _, accInfo := range accounts {
+					uidInt := int64(0)
+					// 尝试从运行中的实例获取 UID
+					if acc, ok := s.BM.Get(accInfo.ID); ok {
+						if inst := acc.Instance(); inst != nil {
+							if uid := inst.SelfUID(); uid != "" {
+								uidInt, _ = parseI64(uid)
+							}
+						}
+					}
+					// 回退到元数据中的 UID
+					if uidInt == 0 && accInfo.UID != "" {
+						uidInt, _ = parseI64(accInfo.UID)
+					}
+					ev := EventMeta{
+						Time:          t.Unix(),
+						SelfID:        uidInt,
+						PostType:      "meta_event",
+						MetaEventType: "heartbeat",
+						Interval:      int(interval.Seconds()),
+					}
+					s.Broadcast(ev)
+				}
 			}
-			s.Broadcast(ev)
 		}
 	}()
 }

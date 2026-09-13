@@ -4,8 +4,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"strings"
 	"time"
+
+	"github.com/go-rod/rod"
 )
 
 func base64Std(b []byte) string {
@@ -43,7 +48,7 @@ func (in *Instance) SendMessage(uid, text string, timeout time.Duration) (*SendR
 	in.mu.Lock()
 
 	argJSON, _ := json.Marshal([]map[string]string{{"uid": uid, "text": text}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSendMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSendMessage, string(argJSON)))
 	in.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -77,7 +82,7 @@ func (in *Instance) SendGroupMessage(groupId, text string, timeout time.Duration
 	in.mu.Lock()
 
 	argJSON, _ := json.Marshal([]map[string]string{{"group_id": groupId, "text": text}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSendGroupMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSendGroupMessage, string(argJSON)))
 	in.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -95,6 +100,108 @@ func (in *Instance) SendGroupMessage(groupId, text string, timeout time.Duration
 		return nil, fmt.Errorf("解析发送结果失败: %s", raw)
 	}
 	if out.OK {
+		in.InvalidateConvCache()
+	}
+	return &out, nil
+}
+
+// resolveImageContent 如果 content 是 HTTP URL，下载后转为 base64:// 避免浏览器 CORS 限制。
+func resolveImageContent(content string, msgType string) string {
+	if msgType != "image" && msgType != "sticker" {
+		return content
+	}
+	if !strings.HasPrefix(content, "http://") && !strings.HasPrefix(content, "https://") {
+		return content
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	log.Printf("[图片] 尝试下载: %s", content)
+	resp, err := client.Get(content)
+	if err != nil {
+		log.Printf("[图片] URL 下载失败: %v (url=%s)", err, content)
+		return content
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) == 0 {
+		log.Printf("[图片] URL 读取失败: %v (url=%s)", err, content)
+		return content
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "image/png"
+	}
+	// 只取 mime 部分
+	if idx := strings.Index(ct, ";"); idx > 0 {
+		ct = ct[:idx]
+	}
+	log.Printf("[图片] 下载成功: %d bytes, content-type=%s", len(body), ct)
+	b64 := base64.StdEncoding.EncodeToString(body)
+	return "data:" + ct + ";base64," + b64
+}
+
+// SendMessageWithType 向指定数字 uid 的用户发送不同类型消息（支持文本、图片、表情包）。
+func (in *Instance) SendMessageWithType(uid, msgType, content string, timeout time.Duration) (*SendResult, error) {
+	if err := in.EnsureSDK(); err != nil {
+		return nil, err
+	}
+	content = resolveImageContent(content, msgType)
+	in.mu.Lock()
+
+	argJSON, _ := json.Marshal([]map[string]string{{"uid": uid, "type": msgType, "content": content}})
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSendMessageWithType, string(argJSON)))
+	in.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	var out SendResult
+	var raw string
+	switch v := res.(type) {
+	case string:
+		raw = v
+	default:
+		b, _ := json.Marshal(res)
+		raw = string(b)
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("解析发送结果失败: %s", raw)
+	}
+	if !out.OK {
+		log.Printf("[发送] uid=%s type=%s 失败: %s", uid, msgType, out.Error)
+	} else {
+		in.InvalidateConvCache()
+	}
+	return &out, nil
+}
+
+// SendGroupMessageWithType 向群聊发送不同类型消息（支持文本、图片、表情包）。
+func (in *Instance) SendGroupMessageWithType(groupId, msgType, content string, timeout time.Duration) (*SendResult, error) {
+	if err := in.EnsureSDK(); err != nil {
+		return nil, err
+	}
+	content = resolveImageContent(content, msgType)
+	in.mu.Lock()
+
+	argJSON, _ := json.Marshal([]map[string]string{{"group_id": groupId, "type": msgType, "content": content}})
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSendGroupMessageWithType, string(argJSON)))
+	in.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	var out SendResult
+	var raw string
+	switch v := res.(type) {
+	case string:
+		raw = v
+	default:
+		b, _ := json.Marshal(res)
+		raw = string(b)
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("解析发送结果失败: %s", raw)
+	}
+	if !out.OK {
+		log.Printf("[发送群聊] groupId=%s type=%s 失败: %s", groupId, msgType, out.Error)
+	} else {
 		in.InvalidateConvCache()
 	}
 	return &out, nil
@@ -123,7 +230,7 @@ func (in *Instance) GetConversations() ([]Conversation, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsGetConversationList)
+	res, err := in.evalToInterface(jsGetConversationList)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +275,7 @@ func (in *Instance) GetHistoryMessages(uid string, count int) ([]HistoryMessage,
 	defer in.mu.Unlock()
 
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"uid": uid, "count": count}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetHistoryMessages, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetHistoryMessages, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -196,20 +303,23 @@ func (in *Instance) GetHistoryMessages(uid string, count int) ([]HistoryMessage,
 
 // IncomingMessage 浏览器推送的新消息（jsRegisterReceiver 上报结构）。
 type IncomingMessage struct {
-	AccountID          string `json:"account_id,omitempty"` // Go侧补充
-	ConversationShortID string `json:"conversation_short_id"`
-	ConversationID     string `json:"conversation_id"`
-	ConversationType   int    `json:"conversation_type"` // 1=private, 2=group
-	Sender             string `json:"sender"`
-	SenderNickname     string `json:"sender_nickname"`
-	Type               int    `json:"type"`
-	MsgType            string `json:"msg_type"` // text / sticker / ...
-	Text               string `json:"text"`
-	Content            string `json:"content"`
-	ClientID           string `json:"client_id"`
-	ServerID           string `json:"server_id"`
-	IsFromMe           bool   `json:"is_from_me"`
-	CreatedAt          int64  `json:"created_at"`
+	AccountID          string      `json:"account_id,omitempty"` // Go侧补充
+	ConversationShortID string     `json:"conversation_short_id"`
+	ConversationID     string      `json:"conversation_id"`
+	ConversationType   int         `json:"conversation_type"` // 1=private, 2=group
+	Sender             string      `json:"sender"`
+	SenderNickname     string      `json:"sender_nickname"`
+	Type               int         `json:"type"`
+	MsgType            string      `json:"msg_type"` // text / image / sticker / ...
+	Text               string      `json:"text"`
+	Content            string      `json:"content"`
+	ClientID           string      `json:"client_id"`
+	ServerID           string      `json:"server_id"`
+	IsFromMe           bool        `json:"is_from_me"`
+	CreatedAt          int64       `json:"created_at"`
+	Image              string      `json:"image,omitempty"`          // 图片URL或base64数据
+	Sticker            string      `json:"sticker,omitempty"`        // 表情包URL或base64数据
+	RawContent         interface{} `json:"raw_content,omitempty"`    // 原始消息内容对象
 }
 
 // MessageEvent 事件总线上的新消息事件载荷。
@@ -238,24 +348,62 @@ func ParseIncoming(raw string) (*IncomingMessage, error) {
 
 var _ = base64Std // 预留工具函数
 
+// evalJS 在页面上执行 JS 并返回字符串结果（统一 Rod Eval 返回值处理）。
+func (in *Instance) evalJS(js string) (string, error) {
+	if in.page == nil {
+		return "", fmt.Errorf("页面未就绪")
+	}
+	// 自动包装：如果用户代码不是以箭头函数/函数开头，则包装为箭头函数
+	trimmed := strings.TrimSpace(js)
+	if !strings.HasPrefix(trimmed, "()") &&
+		!strings.HasPrefix(trimmed, "async") &&
+		!strings.HasPrefix(trimmed, "(async") &&
+		!strings.HasPrefix(trimmed, "(function") &&
+		!strings.HasPrefix(trimmed, "function") {
+		js = "() => " + js
+	}
+	res, err := in.page.Eval(js)
+	if err != nil {
+		return "", err
+	}
+	if res.Value.Str() != "" {
+		return res.Value.Str(), nil
+	}
+	b, _ := json.Marshal(res.Value.Val())
+	return string(b), nil
+}
+
+// evalToInterface 在页面上执行 JS 并返回 interface{} 结果（兼容旧 checkOK 签名）。
+// 返回值始终是 string 类型，但 checkOK 等函数通过 type switch 处理。
+func (in *Instance) evalToInterface(js string) (interface{}, error) {
+	return in.evalJS(js)
+}
+
+var _ = rod.Try // 保持 rod 导入
+
 // ---------- 用户信息 ----------
 
 // UserInfo 用户详细信息。
 type UserInfo struct {
-	UID                  string `json:"uid"`
-	SecUID               string `json:"sec_uid"`
-	Nickname             string `json:"nickname"`
-	UniqueID             string `json:"unique_id"`
-	ShortID              string `json:"short_id"`
-	Signature            string `json:"signature"`
-	AvatarThumb          string `json:"avatar_thumb"`
-	AvatarSmall          string `json:"avatar_small"`
-	FollowStatus         int    `json:"follow_status"`
-	FollowerStatus       int    `json:"follower_status"`
-	VerificationType     int    `json:"verification_type"`
-	CustomVerify         string `json:"custom_verify"`
+	UserID                 int64  `json:"user_id"`
+	UID                    string `json:"uid"`
+	SecUID                 string `json:"sec_uid"`
+	Nickname               string `json:"nickname"`
+	Qid                    string `json:"qid"`
+	ShortID                string `json:"short_id"`
+	Signature              string `json:"signature"`
+	AvatarThumb            string `json:"avatar_thumb"`
+	AvatarSmall            string `json:"avatar_small"`
+	FollowStatus           int    `json:"follow_status"`
+	FollowerStatus         int    `json:"follower_status"`
+	VerificationType       int    `json:"verification_type"`
+	CustomVerify           string `json:"custom_verify"`
 	EnterpriseVerifyReason string `json:"enterprise_verify_reason"`
-	StoreRegion          string `json:"store_region"`
+	Sex                    int    `json:"sex"`
+	Age                    int    `json:"age"`
+	TotalFavorited         int64  `json:"total_favorited"`
+	FavoritingCount        int    `json:"favoriting_count"`
+	FriendshipStatus       int    `json:"friendship_status"`
 }
 
 // GetUserInfo 获取用户详细信息。
@@ -266,7 +414,7 @@ func (in *Instance) GetUserInfo(userID string) (*UserInfo, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"user_id": userID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetUserInfo, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetUserInfo, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -278,18 +426,22 @@ func (in *Instance) GetUserInfo(userID string) (*UserInfo, error) {
 		b, _ := json.Marshal(res)
 		raw = string(b)
 	}
-	var out struct {
-		Ok    bool     `json:"ok"`
-		Error string   `json:"error"`
-		User  UserInfo `json:"user"`
+	// JS 返回扁平格式：{ ok, user_id, uid, sec_uid, nickname, ... }
+	var out UserInfo
+	var resp struct {
+		Ok    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		return nil, fmt.Errorf("解析用户信息失败: %s", raw)
+	}
+	if !resp.Ok {
+		return nil, fmt.Errorf("%s", resp.Error)
 	}
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil, fmt.Errorf("解析用户信息失败: %s", raw)
 	}
-	if !out.Ok {
-		return nil, fmt.Errorf("%s", out.Error)
-	}
-	return &out.User, nil
+	return &out, nil
 }
 
 // GetStrangers 获取陌生人会话列表。
@@ -299,7 +451,7 @@ func (in *Instance) GetStrangers() ([]Conversation, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsGetStrangers)
+	res, err := in.evalToInterface(jsGetStrangers)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +487,7 @@ func (in *Instance) FollowUser(secUID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"sec_uid": secUID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsFollowUser, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsFollowUser, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -350,7 +502,7 @@ func (in *Instance) SetUserBlockStatus(secUID string, block bool) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"sec_uid": secUID, "block": block}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSetUserBlockStatus, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSetUserBlockStatus, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -365,7 +517,7 @@ func (in *Instance) UpdateUserRemarkName(secUID, remark string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"sec_uid": secUID, "remark": remark}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsUpdateUserRemarkName, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsUpdateUserRemarkName, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -382,7 +534,7 @@ func (in *Instance) RecallMessage(conversationID, serverID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "server_id": serverID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsRecallMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsRecallMessage, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -397,7 +549,7 @@ func (in *Instance) DeleteMessage(conversationID, serverID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "server_id": serverID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsDeleteMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsDeleteMessage, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -412,7 +564,7 @@ func (in *Instance) LikeMessage(conversationID, serverID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "server_id": serverID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsLikeMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsLikeMessage, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -437,7 +589,7 @@ func (in *Instance) ReplyMessage(conversationID, serverID, text string) (*ReplyR
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "server_id": serverID, "text": text}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsReplyMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsReplyMessage, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +618,7 @@ func (in *Instance) SetConversationPin(conversationID string, pinned bool) error
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "pinned": pinned}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSetConversationPin, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSetConversationPin, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -481,7 +633,7 @@ func (in *Instance) SetConversationMute(conversationID string, muted bool) error
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "muted": muted}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSetConversationMute, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSetConversationMute, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -495,7 +647,7 @@ func (in *Instance) DeleteConversation(conversationID string) error {
 	}
 	in.mu.Lock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsDeleteConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsDeleteConversation, string(argJSON)))
 	in.mu.Unlock()
 	if err != nil {
 		return err
@@ -514,7 +666,7 @@ func (in *Instance) MarkConversationRead(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsMarkConversationRead, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsMarkConversationRead, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -531,7 +683,7 @@ func (in *Instance) LeaveConversation(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsLeaveConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsLeaveConversation, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -546,7 +698,7 @@ func (in *Instance) DissolveConversation(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsDissolveConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsDissolveConversation, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -569,7 +721,7 @@ func (in *Instance) GetConversationParticipants(conversationID string) ([]GroupP
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipants, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipants, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +756,7 @@ func (in *Instance) AddParticipants(conversationID string, secUIDs []string) err
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "sec_uids": secUIDs}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsAddParticipants, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsAddParticipants, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -619,7 +771,7 @@ func (in *Instance) RemoveParticipants(conversationID string, secUIDs []string) 
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "sec_uids": secUIDs}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsRemoveParticipants, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsRemoveParticipants, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -634,7 +786,7 @@ func (in *Instance) CreateConversation(participants []string, convType int, name
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"participants": participants, "type": convType, "name": name}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsCreateConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsCreateConversation, string(argJSON)))
 	if err != nil {
 		return false, err
 	}
@@ -693,7 +845,7 @@ func (in *Instance) GetMessagesByUser(conversationID string) ([]HistoryMessage, 
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetMessagesByUser, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetMessagesByUser, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -728,7 +880,7 @@ func (in *Instance) GetMessagesByConversation(conversationID string) ([]HistoryM
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetMessagesByConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetMessagesByConversation, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -763,7 +915,7 @@ func (in *Instance) FetchConversation(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsFetchConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsFetchConversation, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -778,7 +930,7 @@ func (in *Instance) UpdateConversationReadReceipt(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsUpdateConversationReadReceipt, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsUpdateConversationReadReceipt, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -799,7 +951,7 @@ func (in *Instance) GetMessageReadReceipt(conversationID, serverID string) (*Rea
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "server_id": serverID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetMessageReadReceipt, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetMessageReadReceipt, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +985,7 @@ func (in *Instance) GetParticipantsReadAndMinIndex(conversationID string) (inter
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetParticipantsReadAndMinIndex, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetParticipantsReadAndMinIndex, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -867,7 +1019,7 @@ func (in *Instance) GetConversationParticipantsAsync(conversationID string) ([]G
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipantsAsync, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipantsAsync, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -902,7 +1054,7 @@ func (in *Instance) GetConversationParticipantsByPage(conversationID string, pag
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "page": page, "page_size": pageSize}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipantsByPage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetConversationParticipantsByPage, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -936,7 +1088,7 @@ func (in *Instance) ApplyJoinGroup(groupShortID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"group_short_id": groupShortID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsApplyJoinGroup, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsApplyJoinGroup, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -951,7 +1103,7 @@ func (in *Instance) UpsertConversationSettingExtInfo(conversationID string, extI
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "ext_info": extInfo}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsUpsertConversationSettingExtInfo, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsUpsertConversationSettingExtInfo, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -966,7 +1118,7 @@ func (in *Instance) GetConversationBots(conversationID string) (interface{}, err
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetConversationBots, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetConversationBots, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1000,7 +1152,7 @@ func (in *Instance) GetStrangerConversationMessage(conversationID string) ([]His
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetStrangerConversationMessage, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetStrangerConversationMessage, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1035,7 +1187,7 @@ func (in *Instance) DeleteStrangerConversation(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsDeleteStrangerConversation, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsDeleteStrangerConversation, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1049,7 +1201,7 @@ func (in *Instance) DeleteAllStrangerConversation() error {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsDeleteAllStrangerConversation)
+	res, err := in.evalToInterface(jsDeleteAllStrangerConversation)
 	if err != nil {
 		return err
 	}
@@ -1064,7 +1216,7 @@ func (in *Instance) MarkStrangerConversationRead(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsMarkStrangerConversationRead, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsMarkStrangerConversationRead, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1078,7 +1230,7 @@ func (in *Instance) MarkAllStrangerConversationRead() error {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsMarkAllStrangerConversationRead)
+	res, err := in.evalToInterface(jsMarkAllStrangerConversationRead)
 	if err != nil {
 		return err
 	}
@@ -1092,7 +1244,7 @@ func (in *Instance) GetStrangerPreview() (interface{}, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsGetStrangerPreview)
+	res, err := in.evalToInterface(jsGetStrangerPreview)
 	if err != nil {
 		return nil, err
 	}
@@ -1126,7 +1278,7 @@ func (in *Instance) BatchClearConversationRead(conversationIDs []string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_ids": conversationIDs}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsBatchClearConversationRead, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsBatchClearConversationRead, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1141,7 +1293,7 @@ func (in *Instance) ClearConversationMessages(conversationID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsClearConversationMessages, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsClearConversationMessages, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1156,7 +1308,7 @@ func (in *Instance) AddOrUpdateLocalExts(conversationID string, exts map[string]
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "exts": exts}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsAddOrUpdateLocalExts, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsAddOrUpdateLocalExts, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1171,7 +1323,7 @@ func (in *Instance) DeleteLocalExts(conversationID string, keys []string) error 
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]interface{}{{"conversation_id": conversationID, "keys": keys}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsDeleteLocalExts, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsDeleteLocalExts, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1186,7 +1338,7 @@ func (in *Instance) ReportMessageDelayTime(serverID, logID string) error {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"server_id": serverID, "log_id": logID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsReportMessageDelayTime, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsReportMessageDelayTime, string(argJSON)))
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1352,7 @@ func (in *Instance) DbClear() error {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsDbClear)
+	res, err := in.evalToInterface(jsDbClear)
 	if err != nil {
 		return err
 	}
@@ -1217,7 +1369,7 @@ func (in *Instance) SearchConversations(keyword string) (interface{}, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"keyword": keyword}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSearchConversations, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSearchConversations, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1251,7 +1403,7 @@ func (in *Instance) SearchParticipants(conversationID, keyword string) (interfac
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID, "keyword": keyword}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsSearchParticipants, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsSearchParticipants, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1284,7 +1436,7 @@ func (in *Instance) RequestRelationsData() error {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsRequestRelationsData)
+	res, err := in.evalToInterface(jsRequestRelationsData)
 	if err != nil {
 		return err
 	}
@@ -1298,7 +1450,7 @@ func (in *Instance) GenLocalUsers() (interface{}, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsGenLocalUsers)
+	res, err := in.evalToInterface(jsGenLocalUsers)
 	if err != nil {
 		return nil, err
 	}
@@ -1332,7 +1484,7 @@ func (in *Instance) LoadMessages(conversationID string) (interface{}, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"conversation_id": conversationID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsLoadMessages, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsLoadMessages, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1366,7 +1518,7 @@ func (in *Instance) GetMessageByServerId(serverID string) (interface{}, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	argJSON, _ := json.Marshal([]map[string]string{{"server_id": serverID}})
-	res, err := in.page.Evaluate(fmt.Sprintf("(%s)(%s)", jsGetMessageByServerId, string(argJSON)))
+	res, err := in.evalToInterface(fmt.Sprintf("(%s)(%s)", jsGetMessageByServerId, string(argJSON)))
 	if err != nil {
 		return nil, err
 	}
@@ -1407,7 +1559,7 @@ func (in *Instance) GetAllGroupConversation() (interface{}, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsGetAllGroupConversation)
+	res, err := in.evalToInterface(jsGetAllGroupConversation)
 	if err != nil {
 		return nil, err
 	}
@@ -1440,7 +1592,7 @@ func (in *Instance) LoadMoreConversations() (interface{}, error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	res, err := in.page.Evaluate(jsLoadMoreConversations)
+	res, err := in.evalToInterface(jsLoadMoreConversations)
 	if err != nil {
 		return nil, err
 	}

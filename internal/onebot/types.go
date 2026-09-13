@@ -2,7 +2,7 @@ package onebot
 
 // OneBot v11 相关类型定义（仅实现本项目用到的子集）。
 // 参考: https://raw.githubusercontent.com/botuniverse/onebot-11/master/api/public.md
-// 扩展：请求参数可携带 account_id / self_id 以路由到指定抖音账号。
+// 扩展：请求参数可携带 self_id 以路由到指定抖音账号。
 
 import (
 	"encoding/json"
@@ -39,7 +39,6 @@ func failResult(code int, msg string, echo interface{}) *ActionResult {
 
 // SendMsgRequest 发送消息通用请求。
 type SendMsgRequest struct {
-	AccountID  string      `json:"account_id,omitempty"`
 	SelfID     interface{} `json:"self_id,omitempty"` // 兼容：标准字段复用为账号路由
 	UserID     interface{} `json:"user_id,omitempty"`
 	GroupID    interface{} `json:"group_id,omitempty"`
@@ -52,12 +51,12 @@ type SendMsgRequest struct {
 type LoginInfo struct {
 	UserID      int64  `json:"user_id"`
 	Nickname    string `json:"nickname"`
-	SecUID      string `json:"sec_uid,omitempty"`
-	UniqueID    string `json:"unique_id,omitempty"`
+	Sex         string `json:"sex,omitempty"`
+	Age         int    `json:"age,omitempty"`
+	Qid         string `json:"qid,omitempty"`
 	ShortID     string `json:"short_id,omitempty"`
 	Avatar      string `json:"avatar,omitempty"`
 	Signature   string `json:"signature,omitempty"`
-	Gender      int    `json:"gender,omitempty"`
 	SDKReady    bool   `json:"sdk_ready"`
 	ModID       int    `json:"mod_id,omitempty"`
 	Connection  string `json:"connection_status,omitempty"`
@@ -65,12 +64,15 @@ type LoginInfo struct {
 
 // FriendItem 好友列表项（由会话列表生成）。
 type FriendItem struct {
-	UserID   int64  `json:"user_id"`
-	Nickname string `json:"nickname"`
-	Remark   string `json:"remark"`
-	DyID     string `json:"dy_id"`
-	ShortID  string `json:"short_id"`
-	Avatar   string `json:"avatar"`
+	UserID      int64  `json:"user_id"`
+	Nickname    string `json:"nickname"`
+	Remark      string `json:"remark"`
+	Qid         string `json:"qid"`
+	ShortID     string `json:"short_id"`
+	Avatar      string `json:"avatar"`
+	Sex         string `json:"sex,omitempty"`
+	Age         int    `json:"age,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 // GroupItem 群列表项。
@@ -82,7 +84,6 @@ type GroupItem struct {
 
 // HistoryMsgRequest 自定义扩展接口请求。
 type HistoryMsgRequest struct {
-	AccountID     string      `json:"account_id,omitempty"`
 	SelfID        interface{} `json:"self_id,omitempty"`
 	UserID        interface{} `json:"user_id,omitempty"`
 	GroupID       interface{} `json:"group_id,omitempty"`
@@ -95,8 +96,8 @@ type HistoryMsgRequest struct {
 
 // VersionInfo get_version_info 返回。
 type VersionInfo struct {
-	AppName       string `json:"app_name"`
-	Version       string `json:"version"`
+	AppName         string `json:"app_name"`
+	AppVersion      string `json:"app_version"`
 	ProtocolVersion string `json:"protocol_version"`
 }
 
@@ -113,19 +114,24 @@ type StatusInfo struct {
 
 // EventMessage 私聊/群聊消息事件（WS 推送）。
 type EventMessage struct {
-	Time        int64       `json:"time"`
-	SelfID      int64       `json:"self_id"`
-	AccountID   string      `json:"account_id,omitempty"` // 扩展字段
-	PostType    string      `json:"post_type"`            // message
-	MessageType string      `json:"message_type"`         // private / group
-	SubType     string      `json:"sub_type"`             // friend / normal
-	UserID      int64       `json:"user_id"`
-	GroupID     int64       `json:"group_id,omitempty"`
-	Message     interface{} `json:"message"`
-	RawMessage  string      `json:"raw_message"`
-	Font        int         `json:"font"`
-	Sender      EventSender `json:"sender"`
-	MessageID   int64       `json:"message_id"`
+	Time            int64       `json:"time"`
+	SelfID          int64       `json:"self_id"`
+	PostType        string      `json:"post_type"`            // message / message_sent
+	MessageType     string      `json:"message_type"`         // private / group
+	SubType         string      `json:"sub_type"`             // friend / normal
+	UserID          int64       `json:"user_id"`
+	GroupID         int64       `json:"group_id,omitempty"`
+	Message         interface{} `json:"message"`
+	RawMessage      string      `json:"raw_message"`
+	Font            int         `json:"font"`
+	Sender          EventSender `json:"sender"`
+	MessageID       int64       `json:"message_id"`
+	RealID          int64       `json:"real_id"`
+	MessageSeq      int         `json:"message_seq,omitempty"`
+	MessageSentType string      `json:"message_sent_type,omitempty"` // self
+	Image           string      `json:"image,omitempty"`             // 图片URL或base64数据
+	Sticker         string      `json:"sticker,omitempty"`           // 表情包URL或base64数据
+	RawContent      interface{} `json:"raw_content,omitempty"`       // 原始消息内容对象
 }
 
 type EventSender struct {

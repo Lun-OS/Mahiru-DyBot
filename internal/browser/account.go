@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +111,9 @@ type AccountManager struct {
 	accounts   map[string]*Account
 	bus        *eventbus.Bus
 	listenAddr string // 服务监听地址，用于构建 JS→Go 回调 URL
+
+	// onUIDChanged 当账号 UID 变化时回调（用于断开 OneBot 连接）。
+	onUIDChanged func(accountID, oldUID, newUID string)
 }
 
 // NewAccountManager 加载 accounts.json 并构建管理器。自动扫描磁盘补充 accounts.json 缺失的目录。
@@ -145,12 +149,21 @@ func NewAccountManager(storageRoot string, bus *eventbus.Bus) (*AccountManager, 
 		meta := AccountMeta{
 			ID:        e.Name(),
 			Name:      "恢复的账号",
+			UID:       am.nextUserID(),
 			CreatedAt: time.Now().Unix(),
 		}
 		am.accounts[meta.ID] = &Account{Meta: meta, state: StateStopped}
 		am.accounts[meta.ID].onStateChange = am.publishState
-		log.Printf("[INIT] 扫描发现未注册账号目录: %s，已自动补充", e.Name())
+		log.Printf("[INIT] 扫描发现未注册账号目录: %s，已自动补充 user_id=%s", e.Name(), meta.UID)
 	}
+	// 为没有 UID 的账号分配递增 ID
+	for id, a := range am.accounts {
+		if a.Meta.UID == "" {
+			a.Meta.UID = am.nextUserID()
+			log.Printf("[INIT] 账号 %s 缺少 user_id，已分配: %s", id, a.Meta.UID)
+		}
+	}
+	am.saveLocked()
 	for _, a := range am.accounts {
 		a.onStateChange = am.publishState
 	}
@@ -163,6 +176,13 @@ func (am *AccountManager) SetListenAddr(addr string) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.listenAddr = addr
+}
+
+// SetUIDChangedCallback 设置 UID 变化回调。
+func (am *AccountManager) SetUIDChangedCallback(cb func(accountID, oldUID, newUID string)) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.onUIDChanged = cb
 }
 
 // publishState 发布账号状态事件到总线。
@@ -190,6 +210,7 @@ func (am *AccountManager) saveLocked() {
 }
 
 // Create 新建账号（仅登记元数据，不启动浏览器）。
+// 生成递增 user_id 作为 OneBot 协议标识（从 1000 开始）。
 func (am *AccountManager) Create(name string) (*AccountMeta, error) {
 	if name == "" {
 		name = "账号"
@@ -199,13 +220,27 @@ func (am *AccountManager) Create(name string) (*AccountMeta, error) {
 	m := AccountMeta{
 		ID:        config.NewID("acc"),
 		Name:      name,
+		UID:       am.nextUserID(),
 		CreatedAt: config.NowUnix(),
 	}
 	am.accounts[m.ID] = &Account{Meta: m, state: StateStopped}
 	am.accounts[m.ID].onStateChange = am.publishState
 	am.saveLocked()
-	log.Printf("[账号:%s] 已创建 (%s)", m.ID, name)
+	log.Printf("[账号:%s] 已创建 (%s) user_id=%s", m.ID, name, m.UID)
 	return &m, nil
+}
+
+// nextUserID 生成下一个可用的递增 user_id（从 1000 开始，跳过已存在的 ID）。
+func (am *AccountManager) nextUserID() string {
+	maxID := int64(999)
+	for _, a := range am.accounts {
+		if uid, err := strconv.ParseInt(a.Meta.UID, 10, 64); err == nil && uid >= 1000 {
+			if uid > maxID {
+				maxID = uid
+			}
+		}
+	}
+	return strconv.FormatInt(maxID+1, 10)
 }
 
 // Rename 重命名账号。
@@ -335,26 +370,35 @@ func (am *AccountManager) Info(id string) (*AccountInfo, bool) {
 }
 
 // Resolve 选择目标账号：
-//   - id 非空 → 定向查找（须在线）
+//   - id 非空 → 先按容器 ID 查找，再按 UID 查找，最后回退到第一个在线账号
 //   - id 为空 → 仅一个在线账号时自动选择，否则报错并列出可用账号
 func (am *AccountManager) Resolve(id string) (*Account, error) {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 	if id != "" {
-		a, ok := am.accounts[id]
-		if !ok {
-			// ID 不匹配时，回退到第一个在线账号（兼容 OneBot 客户端发任意 self_id）
-			for _, a2 := range am.accounts {
-				if a2.State() == StateOnline {
-					return a2, nil
-				}
+		// 1. 按容器 ID 查找
+		if a, ok := am.accounts[id]; ok {
+			if a.State() != StateOnline {
+				return nil, fmt.Errorf("账号 %s 不在线(当前 %s)", id, a.State())
 			}
-			return nil, fmt.Errorf("账号不存在: %s", id)
+			return a, nil
 		}
-		if a.State() != StateOnline {
-			return nil, fmt.Errorf("账号 %s 不在线(当前 %s)", id, a.State())
+		// 2. 按 UID 查找
+		for _, a := range am.accounts {
+			if a.Meta.UID == id {
+				if a.State() != StateOnline {
+					return nil, fmt.Errorf("账号 %s 不在线(当前 %s)", id, a.State())
+				}
+				return a, nil
+			}
 		}
-		return a, nil
+		// 3. 回退到第一个在线账号（兼容 OneBot 客户端发任意 self_id）
+		for _, a2 := range am.accounts {
+			if a2.State() == StateOnline {
+				return a2, nil
+			}
+		}
+		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
 	var online []*Account
 	for _, a := range am.accounts {
@@ -408,6 +452,7 @@ func (am *AccountManager) Start(id string) error {
 			a.mu.Lock()
 			a.inst = nil
 			a.mu.Unlock()
+			// fall through to create new instance
 		} else {
 			a.setState(StateStarting, "")
 			go am.startAsync(a, inst, id, name)
@@ -463,7 +508,8 @@ func (am *AccountManager) startAsync(a *Account, in *Instance, id, name string) 
 	}
 	log.Printf("[账号:%s/%s] 浏览器已启动，检测登录态...", id, name)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Launch 已等待页面加载+检测登录态，这里用更长的超时重检
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	loggedIn, _ := in.IsLoggedIn(ctx)
 	if loggedIn {
@@ -481,17 +527,18 @@ func (am *AccountManager) startAsync(a *Account, in *Instance, id, name string) 
 func (am *AccountManager) watchLogin(a *Account, in *Instance, id, name string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	maxWait := 10 * time.Minute // 最多等10分钟
+	maxWait := 60 * time.Minute // 最多等60分钟
 	deadline := time.Now().Add(maxWait)
 	for {
 		select {
 		case <-ticker.C:
 			// 只在 qr_pending 状态下检测
 			if a.State() != StateQRPending {
+				log.Printf("[账号:%s/%s] watchLogin: 状态已变为 %s，停止轮询", id, name, a.State())
 				return
 			}
 			if time.Now().After(deadline) {
-				log.Printf("[账号:%s/%s] 自动登录检测超时(%v)，停止轮询", id, name, maxWait)
+				log.Printf("[账号:%s/%s] 自动登录检测超时(%v)，停止轮询（可通过 recheck-login 重新检测）", id, name, maxWait)
 				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -507,10 +554,16 @@ func (am *AccountManager) watchLogin(a *Account, in *Instance, id, name string) 
 				a.setState(StateError, "自动Finalize失败: "+ferr.Error())
 			} else {
 				log.Printf("[账号:%s/%s] 自动 Finalize 成功，已上线", id, name)
+				go am.initSDKBackground(a, in, id, name)
 			}
 			return
 		}
 	}
+}
+
+// InitSDKBackground 后台初始化 SDK + 启动健康监控 + Go侧消息轮询（导出供 WebUI 调用）。
+func (am *AccountManager) InitSDKBackground(a *Account, in *Instance, id string) {
+	am.initSDKBackground(a, in, id, a.Meta.Name)
 }
 
 // initSDKBackground 后台初始化 SDK + 启动健康监控 + Go侧消息轮询。
@@ -535,21 +588,29 @@ func (am *AccountManager) initSDKBackground(a *Account, in *Instance, id, name s
 }
 
 // updateLoginMeta 登录成功后回填 UID/昵称到元数据。
+// 如果 UID 发生变化，触发 onUIDChanged 回调（用于断开 OneBot 连接）。
 func (am *AccountManager) updateLoginMeta(a *Account, in *Instance) {
 	a.mu.Lock()
+	oldUID := a.Meta.UID
 	if u := in.SelfUID(); u != "" {
 		a.Meta.UID = u
 	}
 	if n := in.SelfNickname(); n != "" {
 		a.Meta.Nickname = n
 	}
+	newUID := a.Meta.UID
+	cb := am.onUIDChanged
 	a.mu.Unlock()
 	am.mu.Lock()
 	am.saveLocked()
 	am.mu.Unlock()
+	// 如果 UID 变化，触发回调
+	if cb != nil && oldUID != newUID && newUID != "" {
+		go cb(a.Meta.ID, oldUID, newUID)
+	}
 }
 
-// Stop 停止账号浏览器（断开 CDP 但保留 Chrome 进程，保留浏览器内存态）。
+// Stop 停止账号浏览器（关闭浏览器并 kill Chrome 进程）。
 func (am *AccountManager) Stop(id string) error {
 	a, ok := am.Get(id)
 	if !ok {
@@ -561,9 +622,27 @@ func (am *AccountManager) Stop(id string) error {
 	a.setState(StateStopped, "")
 	if inst != nil {
 		inst.Disconnect()
-		log.Printf("[账号:%s] 浏览器已断开（Chrome 进程保留）", id)
+		log.Printf("[账号:%s] 浏览器已断开，Chrome 进程已终止", id)
 	}
 	return nil
+}
+
+// StopAll 停止所有账号的浏览器（服务器退出时调用）。
+func (am *AccountManager) StopAll() {
+	am.mu.RLock()
+	ids := make([]string, 0, len(am.accounts))
+	for id := range am.accounts {
+		ids = append(ids, id)
+	}
+	am.mu.RUnlock()
+
+	for _, id := range ids {
+		if err := am.Stop(id); err != nil {
+			log.Printf("[SHUTDOWN] 停止账号 %s 失败: %v", id, err)
+		} else {
+			log.Printf("[SHUTDOWN] 账号 %s 已停止", id)
+		}
+	}
 }
 
 // FinalizeLogin 扫码确认后的收尾：EnsureReady + 回填元数据 + 置 online。
@@ -588,4 +667,40 @@ func (am *AccountManager) FinalizeLogin(id string) error {
 		a.setState(StateError, "浏览器页面异常")
 	})
 	return nil
+}
+
+// RecheckLogin 手动重新检测登录状态（恢复 watchLogin 超时后卡住的 qr_pending）。
+// 如果检测到已登录，自动执行 Finalize + SDK 初始化。
+func (am *AccountManager) RecheckLogin(id string) (bool, error) {
+	a, ok := am.Get(id)
+	if !ok {
+		return false, errors.New("账号不存在")
+	}
+	st := a.State()
+	if st == StateOnline {
+		return true, nil
+	}
+	if st != StateQRPending {
+		return false, fmt.Errorf("账号状态为 %s，不在 qr_pending 状态", st)
+	}
+	inst := a.Instance()
+	if inst == nil {
+		return false, errors.New("浏览器未启动")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	loggedIn, err := inst.IsLoggedIn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("登录检测失败: %w", err)
+	}
+	if !loggedIn {
+		log.Printf("[账号:%s/%s] recheck-login: 页面未登录", id, a.Meta.Name)
+		return false, nil
+	}
+	log.Printf("[账号:%s/%s] recheck-login: 检测到已登录，执行 Finalize...", id, a.Meta.Name)
+	if ferr := am.FinalizeLogin(id); ferr != nil {
+		return false, fmt.Errorf("FinalizeLogin 失败: %w", ferr)
+	}
+	go am.initSDKBackground(a, inst, id, a.Meta.Name)
+	return true, nil
 }

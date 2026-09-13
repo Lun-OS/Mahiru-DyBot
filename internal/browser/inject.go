@@ -16,7 +16,7 @@ package browser
 // 动态搜索含 ZP 导出的 webpack 模块（硬编码 ID 在不同会话/UA 下会变）。
 // 带超时保护，避免 ZP() Promise 永远挂起。
 const jsBootstrap = `
-(async () => {
+async () => {
     var _globalTimeout = new Promise(function(_, rej) { setTimeout(function() { rej(new Error('global timeout 25s')); }, 25000); });
     var _work = (async () => {
     try {
@@ -75,7 +75,7 @@ const jsBootstrap = `
     }
     })();
     return Promise.race([_work, _globalTimeout]);
-})()
+}
 `
 
 // jsCheckLogin 检测登录状态并返回完整用户信息。
@@ -233,6 +233,131 @@ async (args) => {
 }
 `
 
+// jsSendMessageWithType 通过 SDK 发送不同类型消息（支持文本、图片、表情包）。
+// 参数: [{ uid: 目标用户数字uid, type: 'text'|'image'|'sticker', content: OneBot v11 标准 file 格式 }]
+const jsSendMessageWithType = `
+async (args) => {
+    try {
+        var inst = window.__sdkInst;
+        var cm = window.__imCtx && window.__imCtx.imSdkService && window.__imCtx.imSdkService.conversationManager;
+        if (!inst || !cm) return JSON.stringify({ ok: false, error: 'SDK 未初始化', stage: 'init' });
+
+        var uid = String(args[0].uid);
+        var msgType = String(args[0].type || 'text');
+        var content = args[0].content || '';
+
+        var conv = await cm.getOrCreatePrivateConversationByUid(uid);
+        if (!conv) return JSON.stringify({ ok: false, error: '无法定位会话: ' + uid, stage: 'get_conv' });
+
+        var msg = null;
+        if (msgType === 'text') {
+            msg = await inst.createMessage({
+                conversation: conv,
+                content: JSON.stringify({ aweType: 700, type: 0, richTextInfos: [], text: content }),
+                type: 7,
+                insert: true
+            });
+        } else if (msgType === 'image' || msgType === 'sticker') {
+            var imageBlob = null;
+
+            if (content.indexOf('base64://') === 0) {
+                var b64 = content.substring(9);
+                var raw = atob(b64);
+                var arr = new Uint8Array(raw.length);
+                for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+                imageBlob = new Blob([arr], { type: 'image/png' });
+            } else if (content.indexOf('data:') === 0 && content.indexOf('base64,') >= 0) {
+                var parts = content.split(',');
+                var mime = parts[0].match(/data:([^;]+)/)[1] || 'image/png';
+                var b64 = parts[1];
+                var raw = atob(b64);
+                var arr = new Uint8Array(raw.length);
+                for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+                imageBlob = new Blob([arr], { type: mime });
+            } else if (content.indexOf('http://') === 0 || content.indexOf('https://') === 0) {
+                var resp = await fetch(content);
+                imageBlob = await resp.blob();
+            } else {
+                return JSON.stringify({ ok: false, error: '不支持的图片格式，请提供 base64:// 或 URL', stage: 'format' });
+            }
+
+            if (!imageBlob) {
+                return JSON.stringify({ ok: false, error: '图片数据为空', stage: 'blob' });
+            }
+
+            var ext = (imageBlob.type || 'image/png').indexOf('gif') >= 0 ? 'gif' : 'png';
+            var fileName = 'image.' + ext;
+
+            var uploadErr = null;
+            try {
+                msg = await inst.createFileMessage({
+                    conversation: conv,
+                    file: imageBlob,
+                    fileName: fileName,
+                    insert: true
+                });
+            } catch (e1) { uploadErr = e1; }
+
+            if (!msg) {
+                try {
+                    var imageContent = { aweType: 800, type: 0, image_id: '', image_url: '', width: 0, height: 0 };
+                    if (msgType === 'sticker') imageContent.is_sticker = true;
+                    msg = await inst.createMessage({
+                        conversation: conv,
+                        content: JSON.stringify(imageContent),
+                        file: imageBlob,
+                        type: 8,
+                        insert: true
+                    });
+                } catch (e2) { uploadErr = e2; }
+            }
+
+            if (!msg) {
+                return JSON.stringify({ ok: false, error: '图片消息创建失败: ' + (uploadErr ? uploadErr.message || String(uploadErr) : '未知错误'), stage: 'create_img' });
+            }
+        }
+
+        if (!msg) {
+            return JSON.stringify({ ok: false, error: '不支持的消息类型: ' + msgType, stage: 'create_msg' });
+        }
+
+        var sendRes = await inst.sendMessage({ message: msg });
+        var isOk = false;
+        var errorMsg = '';
+        if (sendRes && sendRes.success !== undefined) {
+            isOk = !!sendRes.success;
+            if (!isOk && sendRes.payload && sendRes.payload.error) errorMsg = String(sendRes.payload.error);
+        } else if (sendRes && sendRes.code !== undefined) {
+            isOk = sendRes.code === 0;
+            if (!isOk) errorMsg = 'code=' + sendRes.code;
+        } else { isOk = true; }
+
+        var serverId = '', clientId = '', errorCode = 0, errorMsg2 = '';
+        try {
+            if (sendRes && sendRes.payload) {
+                var p = sendRes.payload;
+                serverId = String(p.serverId || p.server_id || '');
+                clientId = String(p.clientId || p.client_id || '');
+                errorCode = Number(p.errorCode || p.msg_error_code || 0);
+                errorMsg2 = String(p.errorMsg || p.msg_error_msg || '');
+            }
+        } catch (e) {}
+
+        return JSON.stringify({
+            ok: isOk,
+            server_id: serverId,
+            client_id: clientId,
+            conversation_id: String(conv.id || ''),
+            conversation_short_id: String(conv.shortId || ''),
+            error: errorMsg || errorMsg2,
+            msg_error_code: errorCode,
+        });
+    } catch (e) {
+        return JSON.stringify({ ok: false, error: e.message || String(e), stage: 'exception' });
+    }
+}
+`
+
 // jsSendGroupMessage 通过 SDK 发送群聊消息。
 // 参数: [{ group_id: 群会话shortId 或 id, text: 消息内容 }]
 // 注意: 群聊会话必须已存在于会话列表中（已加入的群）。
@@ -262,6 +387,140 @@ async (args) => {
             type: 7,
             insert: true
         });
+        var sendRes = await inst.sendMessage({ message: msg });
+
+        var isOk = false;
+        var errorMsg = '';
+        if (sendRes && sendRes.success !== undefined) {
+            isOk = !!sendRes.success;
+            if (!isOk && sendRes.payload && sendRes.payload.error) errorMsg = String(sendRes.payload.error);
+        } else if (sendRes && sendRes.code !== undefined) {
+            isOk = sendRes.code === 0;
+            if (!isOk) errorMsg = 'code=' + sendRes.code + ' ' + (sendRes.msg || '');
+        } else {
+            isOk = true;
+        }
+
+        var errorCode = msg.errorCode || 0;
+        var errorMsg2 = msg.errorMsg || '';
+        if (errorCode !== 0) { errorMsg = '消息错误: code=' + errorCode + ' msg=' + errorMsg2; isOk = false; }
+
+        var sendDetail = '';
+        try { sendDetail = JSON.stringify(sendRes); } catch (e) { sendDetail = String(sendRes); }
+        if (sendDetail.length > 2000) sendDetail = sendDetail.substring(0, 2000);
+
+        return JSON.stringify({
+            ok: isOk,
+            server_id: String(msg.serverId || ''),
+            client_id: String(msg.clientId || ''),
+            conversation_id: String(conv.id || ''),
+            conversation_short_id: String(conv.shortId || ''),
+            error: errorMsg,
+            msg_error_code: errorCode,
+            msg_error_msg: errorMsg2,
+            send_response: sendDetail,
+        });
+    } catch (e) {
+        return JSON.stringify({ ok: false, error: e.message || String(e), stage: 'exception' });
+    }
+}
+`
+
+// jsSendGroupMessageWithType 通过 SDK 发送群聊不同类型消息（支持文本、图片、表情包）。
+// 参数: [{ group_id: 群会话shortId 或 id, type: 'text'|'image'|'sticker', content: OneBot v11 标准 file 格式 }]
+const jsSendGroupMessageWithType = `
+async (args) => {
+    try {
+        var inst = window.__sdkInst;
+        if (!inst) return JSON.stringify({ ok: false, error: 'SDK 未初始化', stage: 'init' });
+
+        var groupId = String(args[0].group_id);
+        var msgType = String(args[0].type || 'text');
+        var content = args[0].content || '';
+
+        var convList = inst.getConversationList() || [];
+        var conv = null;
+        for (var i = 0; i < convList.length; i++) {
+            var c = convList[i];
+            if (String(c.shortId) === groupId || String(c.id) === groupId) {
+                conv = c;
+                break;
+            }
+        }
+        if (!conv) return JSON.stringify({ ok: false, error: '未找到群聊会话: ' + groupId, stage: 'get_conv' });
+
+        var msg = null;
+        if (msgType === 'text') {
+            msg = await inst.createMessage({
+                conversation: conv,
+                content: JSON.stringify({ aweType: 700, type: 0, richTextInfos: [], text: content }),
+                type: 7,
+                insert: true
+            });
+        } else if (msgType === 'image' || msgType === 'sticker') {
+            var imageBlob = null;
+
+            if (content.indexOf('base64://') === 0) {
+                var b64 = content.substring(9);
+                var raw = atob(b64);
+                var arr = new Uint8Array(raw.length);
+                for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+                imageBlob = new Blob([arr], { type: 'image/png' });
+            } else if (content.indexOf('data:') === 0 && content.indexOf('base64,') >= 0) {
+                var parts = content.split(',');
+                var mime = parts[0].match(/data:([^;]+)/)[1] || 'image/png';
+                var b64 = parts[1];
+                var raw = atob(b64);
+                var arr = new Uint8Array(raw.length);
+                for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+                imageBlob = new Blob([arr], { type: mime });
+            } else if (content.indexOf('http://') === 0 || content.indexOf('https://') === 0) {
+                var resp = await fetch(content);
+                imageBlob = await resp.blob();
+            } else {
+                return JSON.stringify({ ok: false, error: '不支持的图片格式，请提供 base64:// 或 URL', stage: 'format' });
+            }
+
+            if (!imageBlob) {
+                return JSON.stringify({ ok: false, error: '图片数据为空', stage: 'blob' });
+            }
+
+            var ext = (imageBlob.type || 'image/png').indexOf('gif') >= 0 ? 'gif' : 'png';
+            var fileName = 'image.' + ext;
+
+            var uploadErr = null;
+            try {
+                msg = await inst.createFileMessage({
+                    conversation: conv,
+                    file: imageBlob,
+                    fileName: fileName,
+                    insert: true
+                });
+            } catch (e1) { uploadErr = e1; }
+
+            if (!msg) {
+                try {
+                    var imageContent = { aweType: 800, type: 0, image_id: '', image_url: '', width: 0, height: 0 };
+                    if (msgType === 'sticker') imageContent.is_sticker = true;
+                    msg = await inst.createMessage({
+                        conversation: conv,
+                        content: JSON.stringify(imageContent),
+                        file: imageBlob,
+                        type: 8,
+                        insert: true
+                    });
+                } catch (e2) { uploadErr = e2; }
+            }
+
+            if (!msg) {
+                return JSON.stringify({ ok: false, error: '图片消息创建失败: ' + (uploadErr ? uploadErr.message || String(uploadErr) : '未知错误'), stage: 'create_img' });
+            }
+        }
+
+        if (!msg) {
+            return JSON.stringify({ ok: false, error: '不支持的消息类型: ' + msgType, stage: 'create_msg' });
+        }
+
         var sendRes = await inst.sendMessage({ message: msg });
 
         var isOk = false;
@@ -343,7 +602,8 @@ async () => {
             var toUid = '';
             try { toUid = c.toParticipantUserId === undefined ? '' : String(c.toParticipantUserId); } catch (e) {}
             var toSecUid = convToSecUid[String(c.id)] || '';
-            var nickname = '', remark = '', uniqueId = '', shortIdNum = '', avatar = '';
+            var nickname = '', remark = '', qid = '', shortIdNum = '', avatar = '', sex = '', signature = '';
+            var sexNum = 0, ageNum = 0;
             if (uis && toSecUid) {
                 try {
                     var u = uis.getUserBySecUid(toSecUid);
@@ -351,9 +611,14 @@ async () => {
                     if (u) {
                         nickname = u.nickname || '';
                         remark = u.remark_name || '';
-                        uniqueId = u.unique_id || '';
+                        qid = u.unique_id || '';
                         shortIdNum = u.short_id || '';
                         avatar = u.avatar_uri || '';
+                        signature = u.signature || '';
+                        sexNum = Number(u.sex || u.gender || 0);
+                        ageNum = Number(u.age || 0);
+                        if (sexNum === 1) sex = 'male';
+                        else if (sexNum === 2) sex = 'female';
                     }
                 } catch (e) {}
             }
@@ -366,9 +631,12 @@ async () => {
                 name: name,
                 nickname: nickname,
                 remark_name: remark,
-                unique_id: uniqueId,
+                qid: qid,
                 short_id_num: shortIdNum,
                 avatar: avatar,
+                sex: sex,
+                age: ageNum,
+                signature: signature,
                 unread: Number(c._badgeCount || 0)
             });
         }
@@ -623,43 +891,122 @@ const jsGetSDKStatus = `
 `
 
 // jsGetUserInfo 获取用户详细信息。
-// 参数: [{ user_id: "uid或sec_uid" }]
+// 参数: [{ user_id: "uid" }] — user_id 必须是数字 UID
 const jsGetUserInfo = `
 async (args) => {
     try {
         var inst = window.__sdkInst;
         var ctx = window.__imCtx;
         if (!inst || !ctx) return JSON.stringify({ ok: false, error: 'SDK 未初始化' });
+        var target = String(args[0].user_id).trim();
+        if (!target) return JSON.stringify({ ok: false, error: 'user_id 为空' });
+        
         var us = ctx.store.usersInfoStore;
-        var target = String(args[0].user_id);
-        // 尝试作为 sec_uid 查询
-        var user = await us.getUserBySecUidAsync(target);
-        if (!user) {
-            // 尝试作为 uid 查询 - 遍历所有用户
-            var all = us.allUsers ? us.allUsers() : [];
-            for (var i = 0; i < all.length; i++) {
-                if (String(all[i].uid) === target) { user = all[i]; break; }
+        var user = null;
+        var foundSecUid = '';
+        
+        // 1. 通过会话列表：用 UID 找到对应的 sec_uid
+        try {
+            var list = await inst.getConversationList();
+            for (var i = 0; i < list.length; i++) {
+                var c = list[i];
+                var toUid = '';
+                try { toUid = String(c.toParticipantUserId || ''); } catch (e) {}
+                if (toUid === target) {
+                    // 找到会话，获取参与者信息拿到 sec_uid
+                    try {
+                        var parts = await inst.getConversationParticipants({ conversation: c });
+                        var selfUid = '';
+                        try { selfUid = String((window.userInfoStore && window.userInfoStore.curLoginUserInfo) ? window.userInfoStore.curLoginUserInfo.uid : ''); } catch (e) {}
+                        for (var j = 0; j < parts.length; j++) {
+                            if (parts[j].userId !== selfUid && parts[j].secUid) {
+                                foundSecUid = parts[j].secUid;
+                                break;
+                            }
+                        }
+                    } catch (e) {}
+                    break;
+                }
+            }
+        } catch (e) {}
+        
+        // 2. 用找到的 sec_uid 查询用户详细信息
+        if (foundSecUid) {
+            try { user = await us.getUserBySecUidAsync(foundSecUid); } catch (e) {}
+            // 补充确保用户信息已加载
+            try { await us.doRequestUsersInfoIfNeeded([foundSecUid]); } catch (e) {}
+            if (!user) {
+                try { user = await us.getUserBySecUidAsync(foundSecUid); } catch (e) {}
             }
         }
-        if (!user) return JSON.stringify({ ok: false, error: '用户不存在: ' + target });
+        
+        // 3. 直接在 allUsers 中按 uid 匹配
+        if (!user) {
+            try {
+                var all = us.allUsers ? us.allUsers() : [];
+                for (var k = 0; k < all.length; k++) {
+                    if (String(all[k].uid) === target) { user = all[k]; break; }
+                }
+            } catch (e) {}
+        }
+        
+        // 4. 尝试通过 userCacheManager 获取
+        if (!user) {
+            try {
+                var userCache = sdk.userCacheManager;
+                if (userCache && userCache.getUserInfo) {
+                    var cached = userCache.getUserInfo(target);
+                    if (cached) user = cached;
+                }
+            } catch (e) {}
+        }
+        
+        // 5. 从会话 coreInfo 获取基本昵称
+        var convName = '';
+        var convAvatar = '';
+        if (!user) {
+            try {
+                var list2 = await inst.getConversationList();
+                for (var m = 0; m < list2.length; m++) {
+                    if (String(list2[m].toParticipantUserId || '') === target) {
+                        var ci = list2[m].coreInfo || {};
+                        convName = ci.name || '';
+                        convAvatar = ci.avatar || '';
+                        break;
+                    }
+                }
+            } catch (e) {}
+        }
+        
+        var nickname = user ? (user.nickname || '') : convName;
+        var avatarThumb = '';
+        if (user && user.avatar_thumb && user.avatar_thumb.url_list) {
+            avatarThumb = user.avatar_thumb.url_list[0] || '';
+        } else if (convAvatar) {
+            avatarThumb = convAvatar;
+        }
+        
         return JSON.stringify({
             ok: true,
-            user: {
-                uid: String(user.uid || ''),
-                sec_uid: String(user.sec_uid || ''),
-                nickname: String(user.nickname || ''),
-                unique_id: String(user.unique_id || ''),
-                short_id: String(user.short_id || ''),
-                signature: String(user.signature || ''),
-                avatar_thumb: (user.avatar_thumb && user.avatar_thumb.url_list && user.avatar_thumb.url_list[0]) || '',
-                avatar_small: (user.avatar_small && user.avatar_small.url_list && user.avatar_small.url_list[0]) || '',
-                follow_status: Number(user.follow_status || 0),
-                follower_status: Number(user.follower_status || 0),
-                verification_type: Number(user.verification_type || 0),
-                custom_verify: String(user.custom_verify || ''),
-                enterprise_verify_reason: String(user.enterprise_verify_reason || ''),
-                store_region: String(user.store_region || ''),
-            }
+            user_id: Number(target),
+            uid: String(user ? (user.uid || target) : target),
+            sec_uid: String(user ? (user.sec_uid || foundSecUid) : foundSecUid),
+            nickname: nickname,
+            qid: String(user ? (user.unique_id || '') : ''),
+            short_id: String(user ? (user.short_id || '') : ''),
+            signature: String(user ? (user.signature || '') : ''),
+            avatar_thumb: avatarThumb,
+            avatar_small: avatarThumb,
+            sex: Number(user ? (user.sex || user.gender || 0) : 0),
+            age: Number(user ? (user.age || 0) : 0),
+            follow_status: Number(user ? (user.follow_status || 0) : 0),
+            follower_status: Number(user ? (user.follower_status || 0) : 0),
+            verification_type: Number(user ? (user.verification_type || 0) : 0),
+            custom_verify: String(user ? (user.custom_verify || '') : ''),
+            enterprise_verify_reason: String(user ? (user.enterprise_verify_reason || '') : ''),
+            total_favorited: Number(user ? (user.total_favorited || 0) : 0),
+            favoriting_count: Number(user ? (user.favoriting_count || 0) : 0),
+            friendship_status: Number(user ? (user.friendship_status || 0) : 0),
         });
     } catch (e) {
         return JSON.stringify({ ok: false, error: e.message });
@@ -1114,6 +1461,8 @@ const jsRegisterReceiver = `
                 var parsedContent = null;
                 var text = '';
                 var msgType = 'text';
+                var imageData = '';
+                var stickerData = '';
                 try {
                     parsedContent = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
                 } catch (e) {}
@@ -1124,7 +1473,9 @@ const jsRegisterReceiver = `
                         if (text.indexOf('\\n') === 0) text = text.substring(1);
                         msgType = 'text';
                     } else if (aweType === 800 || parsedContent.image_id !== undefined) {
-                        msgType = 'sticker';
+                        msgType = parsedContent.is_sticker ? 'sticker' : 'image';
+                        imageData = parsedContent.image_id || parsedContent.image_url || '';
+                        stickerData = parsedContent.is_sticker ? imageData : '';
                     }
                 }
                 var senderNickname = '';
@@ -1157,7 +1508,10 @@ const jsRegisterReceiver = `
                     client_id: String(msg.clientId || ''),
                     server_id: String(msg.serverId || ''),
                     is_from_me: !!msg.isFromMe,
-                    created_at: Math.floor((Number(msg.createdAt) || Date.now()) / 1000)
+                    created_at: Math.floor((Number(msg.createdAt) || Date.now()) / 1000),
+                    image: imageData || '',
+                    sticker: stickerData || '',
+                    raw_content: parsedContent || null
                 };
                 window.__obNewMsgs.push(payload);
             } catch (e) {}
@@ -1196,7 +1550,7 @@ const jsRegisterReceiver = `
 `
 
 // jsDrainNewMsgs 从 window.__obNewMsgs 拉取并清空待发消息队列（Go 侧轮询调用）。
-const jsDrainNewMsgs = `(function(){try{var q=window.__obNewMsgs;if(!q||!q.length)return JSON.stringify({ok:true,msgs:[]});var msgs=q.splice(0,q.length);return JSON.stringify({ok:true,msgs:msgs});}catch(e){return JSON.stringify({ok:false,error:e.message});}})()`
+const jsDrainNewMsgs = `() => {try{var q=window.__obNewMsgs;if(!q||!q.length)return JSON.stringify({ok:true,msgs:[]});var msgs=q.splice(0,q.length);return JSON.stringify({ok:true,msgs:msgs});}catch(e){return JSON.stringify({ok:false,error:e.message});}}`
 
 // jsGetMessagesByUser 按用户获取消息列表。
 // 参数: [{ conversation_id: "会话 shortId" }]
