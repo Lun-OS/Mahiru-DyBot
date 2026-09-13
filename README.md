@@ -14,7 +14,7 @@
 
 ## 简介
 
-Mahiru DyBot 通过 Playwright 启动 Chromium 无头浏览器，登录抖音网页版，注入 JavaScript Hook 拦截并劫持抖音内置 IM SDK 的核心模块（`createMessage`、`sendMessage`、`fetchConversation` 等），在浏览器上下文中完成消息收发、会话管理、联系人查询等操作，再通过 Go 后端将这些能力以 OneBot v11 标准协议暴露出来。
+Mahiru DyBot 启动 Chromium 无头浏览器，登录抖音网页版，注入 JavaScript Hook 拦截并劫持抖音内置 IM SDK 的核心模块（`createMessage`、`sendMessage`、`fetchConversation` 等），在浏览器上下文中完成消息收发、会话管理、联系人查询等操作，再通过 Go 后端将这些能力以 OneBot v11 标准协议暴露出来。
 
 ## 实现原理
 
